@@ -1,0 +1,31 @@
+# 凭据 —— 任何情况下都不进仓库
+.env
+*.env
+credentials.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+.vite/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 构建产物与压缩包
+*.zip
+*.7z
+build/
+dist/
+!frontend/dist/
