@@ -1,9 +1,27 @@
+import { useEffect, useMemo, useState } from 'react'
 import RichText from './RichText.jsx'
 import { THESIS_TYPE } from '../lib/ui.js'
 
-export default function ParsedPanel({ run }) {
+export default function ParsedPanel({ run, onRerun, busy }) {
   const p = run.parsed
   const t = THESIS_TYPE[p.thesis_type] || { zh: p.thesis_type, desc: '' }
+
+  // 本轮已经生效的回答。重跑之后新一轮的返回里带着它们，据此回填草稿 ——
+  // 不回填的话，用户重跑一次就会看到自己的选择全部变回默认值，
+  // 分会以为回答没被采纳，而实际上结论已经按它改过了。
+  const applied = useMemo(() => {
+    const seeded = {}
+    for (const c of p.clarifications || []) if (c.answer) seeded[c.question] = c.answer
+    return seeded
+  }, [run.run_id])
+
+  const [draft, setDraft] = useState(applied)
+  useEffect(() => setDraft(applied), [applied])
+
+  const changed = useMemo(() => {
+    const keys = new Set([...Object.keys(draft), ...Object.keys(applied)])
+    return [...keys].filter((k) => (draft[k] || '') !== (applied[k] || ''))
+  }, [draft, applied])
 
   return (
     <section id="parse" className="card scroll-mt-16">
@@ -33,6 +51,10 @@ export default function ParsedPanel({ run }) {
           <VersionBox title="v1 · 你的原话" body={p.v1.text} sub={p.v1.horizon} muted />
           <VersionBox title="v2 · 修订后可验证版本" body={p.v2.text} sub={p.v2.horizon} />
         </div>
+
+        <p className="text-[11px] leading-relaxed text-ink-500">
+          <RichText text={p.v2.decision_context} />
+        </p>
 
         {p.diffs?.length > 0 && (
           <div>
@@ -65,26 +87,96 @@ export default function ParsedPanel({ run }) {
         {p.clarifications?.length > 0 && (
           <div>
             <div className="label mb-1.5">
-              澄清问题 —— 产品会先问清楚，问不到就用下面明写的默认假设继续
+              澄清问题 —— 可以在这里回答；不回答就按下面明写的默认假设继续
             </div>
             <ul className="space-y-2">
-              {p.clarifications.map((c, i) => (
-                <li key={i} className="rounded-md bg-ink-100/60 px-3 py-2">
-                  <RichText
-                    className="block text-[12px] font-medium text-ink-900"
-                    text={c.question}
-                  />
-                  <div className="mt-1 text-[11px] leading-relaxed text-ink-500">
-                    为什么重要：<RichText text={c.why_it_matters} />
-                  </div>
-                  {c.assumption && (
-                    <div className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-relaxed text-amber-800">
-                      默认假设：<RichText text={c.assumption} />
+              {p.clarifications.map((c, i) => {
+                const picked = draft[c.question] || ''
+                const live = applied[c.question] || ''
+                return (
+                  <li key={i} className="rounded-md bg-ink-100/60 px-3 py-2">
+                    <RichText
+                      className="block text-[12px] font-medium text-ink-900"
+                      text={c.question}
+                    />
+                    <div className="mt-1 text-[11px] leading-relaxed text-ink-500">
+                      为什么重要：<RichText text={c.why_it_matters} />
                     </div>
-                  )}
-                </li>
-              ))}
+
+                    {c.options?.length > 0 && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        {c.options.map((o) => {
+                          const on = picked === o
+                          return (
+                            <button
+                              key={o}
+                              type="button"
+                              aria-pressed={on}
+                              onClick={() =>
+                                setDraft((d) => ({ ...d, [c.question]: on ? '' : o }))
+                              }
+                              className={`rounded border px-2 py-0.5 text-[11px] transition-colors ${
+                                on
+                                  ? 'border-ink-900 bg-ink-900 text-white'
+                                  : 'border-ink-300 bg-white text-ink-700 hover:border-ink-900'
+                              }`}
+                            >
+                              <RichText text={o} />
+                            </button>
+                          )
+                        })}
+                        {picked && (
+                          <button
+                            type="button"
+                            onClick={() => setDraft((d) => ({ ...d, [c.question]: '' }))}
+                            className="text-[11px] text-ink-500 underline decoration-dotted"
+                          >
+                            取消这一条
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 本轮**实际生效**的取值。分成两条显示而不是一条，
+                        是因为「你正在改的」和「结论是按哪个算的」必须能分辨 ——
+                        混在一起，用户会以为改一下就立即生效了。 */}
+                    {live && (
+                      <div className="mt-1.5 rounded bg-sup-bg/70 px-2 py-1 text-[11px] leading-relaxed text-sup-fg">
+                        本轮按你的回答计算：<RichText text={live} />
+                      </div>
+                    )}
+                    {live && c.impact && (
+                      <div className="mt-1 rounded bg-white px-2 py-1 text-[11px] leading-relaxed text-ink-700 ring-1 ring-ink-300/70">
+                        它改变了什么：<RichText text={c.impact} />
+                      </div>
+                    )}
+                    {!live && c.assumption && (
+                      <div className="mt-1.5 rounded bg-amber-50 px-2 py-1 text-[11px] leading-relaxed text-amber-800">
+                        默认假设：<RichText text={c.assumption} />
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
             </ul>
+
+            {onRerun && (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy || changed.length === 0}
+                  onClick={() => onRerun(draft)}
+                  className="rounded bg-ink-900 px-3 py-1.5 text-[12px] text-white transition-opacity disabled:opacity-40"
+                >
+                  {busy ? '正在重跑…' : '按我的回答重跑'}
+                </button>
+                <span className="text-[11px] text-ink-500">
+                  {changed.length === 0
+                    ? '改动上面的选项后可以重跑，结论会按你的口径重算'
+                    : `有 ${changed.length} 条待生效，重跑后子问题与结论会一并更新`}
+                </span>
+              </div>
+            )}
           </div>
         )}
 

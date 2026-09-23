@@ -208,7 +208,7 @@ CLARIFY: dict[ThesisType, list[tuple[str, str, list[str], str]]] = {
             "给定的时间窗内是否发生过重大资产重组或主营变更？",
             "若发生，历史可比性被破坏，同比数据的口径不再一致，会在 SQ-03/SQ-04 上产生伪信号。",
             ["发生过", "未发生", "不确定"],
-            "按「未发生」处理，但本产品会在结论的适用边界中声明该假设未经核实",
+            "按「未发生」处理。该假设会随 v2 前提一并披露，如实际发生过可在澄清环节改选后重跑",
         ),
     ],
     ThesisType.ATTRIBUTION: [
@@ -258,17 +258,250 @@ CLARIFY: dict[ThesisType, list[tuple[str, str, list[str], str]]] = {
 }
 
 
-def _clarifications(ttype: ThesisType) -> list[ClarificationQuestion]:
-    return [
-        ClarificationQuestion(
-            question=q,
-            why_it_matters=why,
-            options=opts,
-            assumption=f"用户未指定时，本产品采用：{default}。该假设会随结论一并展示，"
-                       f"并可在界面上修改后重跑。",
+# --------------------------------------------------------------------------
+# 澄清回答 → 下游影响
+#
+# 键是 (命题类型, 该类型下第几个澄清问题, 选项原文)，值是 (影响类型, 作用对象, 说明)。
+#
+# 这张表是**唯一**的描述来源：说明文字取自它，run.py 的改子问题逻辑也取自它。
+# 早先说明是写死的字符串（答了也不会改任何东西），文案与行为各说各话——
+# 产品明说「可在界面上修改后重跑」，而界面上根本没有那个控件。
+#
+# 影响类型只有四种，每种都对应一个真实动作：
+#   unverifiable —— 该子问题在本数据源下无法按用户指定的口径重算，强制判为无法验证
+#   drop         —— 该子问题被移出本轮检验范围，并在跳过层中显式声明
+#   limitation   —— 不改判定，但给结论追加一条适用边界声明
+#   none         —— 用户的选择与本产品默认一致，下游不变
+# --------------------------------------------------------------------------
+
+ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
+    # --- 背离型 ---
+    (ThesisType.DIVERGENCE, 0, "与同业比"): (
+        "unverifiable",
+        "SQ-01",
+        "SQ-01 的参照系被指定为「同业」，而本轮取数只覆盖用户指定的这一只标的："
+        "重建同业各家的 PE 序列需要逐只调历史K线与利润表，本产品当前没有这条取数路径，"
+        "因此该子问题判为无法验证，而不是换成「与自身历史比」硬算一个数给用户。",
+    ),
+    (ThesisType.DIVERGENCE, 0, "与大盘比"): (
+        "unverifiable",
+        "SQ-01",
+        "SQ-01 的参照系被指定为「大盘」。指数的 PE 分位需要指数自身的盈利序列，"
+        "本产品的取数范围只包含标的个股的K线与合并利润表，没有指数盈利数据，"
+        "因此该子问题判为无法验证。",
+    ),
+    (ThesisType.DIVERGENCE, 0, "与自身历史比"): (
+        "none",
+        "",
+        "与产品默认参照系一致，下游取数与判定不变。",
+    ),
+    (ThesisType.DIVERGENCE, 1, "仅收入与利润"): (
+        "drop",
+        "SQ-05",
+        "命题范围被收窄为收入与利润两项，SQ-05（盈利质量与现金流）被移出本轮检验，"
+        "并在「未覆盖的分解层」中显式声明。移出而不是照跑，是因为现金流一旦反对，"
+        "结论就会去否定一个用户没有提出的命题。",
+    ),
+    (ThesisType.DIVERGENCE, 1, "收入利润 + 盈利质量 + 现金流"): (
+        "none",
+        "",
+        "与产品默认口径一致（最严格的一档），下游取数与判定不变。",
+    ),
+    (ThesisType.DIVERGENCE, 2, "发生过"): (
+        "limitation",
+        "",
+        "用户声明时间窗内发生过重大资产重组或主营变更。同口径的同比基础被破坏，"
+        "本轮全部子问题仍会照常计算，但结论的适用边界会加一条声明："
+        "这些同比数字不具备前后可比性，不能直接读作经营层面的变化。",
+    ),
+    (ThesisType.DIVERGENCE, 2, "未发生"): (
+        "none",
+        "",
+        "用户确认时间窗内未发生重大资产重组或主营变更，同比口径成立，本轮无需追加边界声明。",
+    ),
+    (ThesisType.DIVERGENCE, 2, "不确定"): (
+        "limitation",
+        "",
+        "用户表示不确定时间窗内是否发生过重大资产重组或主营变更。本轮按「未发生」处理，"
+        "该假设未经核实，会作为一条边界声明写进结论：若实际发生过，同比数据的口径可比性被破坏，"
+        "本结论的适用性随之下降。用户明确表示不知道时，这条声明就不再是多余的。",
+    ),
+    # --- 归因型 ---
+    (ThesisType.ATTRIBUTION, 0, "归母净利润"): (
+        "none",
+        "",
+        "与产品默认主口径一致，SQ-03 仍以扣非口径做交叉检验，下游不变。",
+    ),
+    (ThesisType.ATTRIBUTION, 0, "扣非净利润"): (
+        "limitation",
+        "",
+        "命题口径被指定为扣非净利润。本轮子问题中的净利润相关项仍按归母口径取数"
+        "（合并利润表口径），非经常性损益的影响由 SQ-03 单独度量。"
+        "结论对扣非口径的适用性由此变成一条需要读者自行判断的边界，会写入适用边界。",
+    ),
+    (ThesisType.ATTRIBUTION, 0, "营业利润"): (
+        "limitation",
+        "",
+        "命题口径被指定为营业利润。本产品取的是合并利润表中的归母净利润与扣非加权ROE，"
+        "未单独取营业利润科目，因此结论对营业利润口径的适用性未经检验，会写入适用边界。",
+    ),
+    (ThesisType.ATTRIBUTION, 1, "上年同期"): (
+        "none",
+        "",
+        "与产品默认基期一致（同 fiscal_period 同比），下游取数与判定不变。",
+    ),
+    (ThesisType.ATTRIBUTION, 1, "上一季度"): (
+        "limitation",
+        "",
+        "基期被指定为上一季度（环比）。本轮全部子问题按「同 fiscal_period 同比」构造，"
+        "不改为环比 —— 换基期会同时改变口径可比性与阈值判定，不能在澄清环节悄悄发生。"
+        "结论对环比口径的适用性未经检验，会写入适用边界。",
+    ),
+    (ThesisType.ATTRIBUTION, 1, "三年前同期"): (
+        "limitation",
+        "",
+        "基期被指定为三年前同期。本轮子问题取的是最新报告期与上一年同一 fiscal_period，"
+        "未回溯三年，因此结论对三年跨度口径的适用性未经检验，会写入适用边界。",
+    ),
+    (ThesisType.ATTRIBUTION, 2, "包含"): (
+        "none",
+        "",
+        "与产品默认口径一致（按报表口径），下游取数与判定不变。",
+    ),
+    (ThesisType.ATTRIBUTION, 2, "仅含成熟业务"): (
+        "unverifiable",
+        "SQ-01",
+        "命题口径被收窄为「仅含成熟业务」。要按该口径重算营收同比，必须有分部收入，"
+        "而扶摇公开接口不提供分部数据 —— 这正是本产品已声明的 MIX 跳过层的同一个缺口。"
+        "因此 SQ-01 判为无法验证，而不是用报表口径的合并营收冒充「成熟业务收入」。",
+    ),
+    (ThesisType.ATTRIBUTION, 2, "不确定"): (
+        "none",
+        "",
+        "与产品默认处理一致（按报表口径），该假设会在结论中声明。",
+    ),
+    # --- 传导型 ---
+    (ThesisType.TRANSMISSION, 0, "原材料价格"): (
+        "limitation",
+        "",
+        "外部变量被明确为「原材料价格」。这不改变本轮结论 —— 无论用户指哪个变量，"
+        "本数据源都无法观测它；但它会把「需要什么数据」写成用户真正关心的那一个，"
+        "而不是泛泛的「产业链外部变量」。",
+    ),
+    (ThesisType.TRANSMISSION, 0, "下游需求"): (
+        "limitation",
+        "",
+        "外部变量被明确为「下游需求」。这不改变本轮结论（该变量在本数据源中不可观测），"
+        "但会把「需要什么数据」具体化为下游需求量或订单类指标。",
+    ),
+    (ThesisType.TRANSMISSION, 0, "政策变化"): (
+        "limitation",
+        "",
+        "外部变量被明确为「政策变化」。这不改变本轮结论（该变量在本数据源中不可观测），"
+        "但会把「需要什么数据」具体化为相关政策文件与生效时点。",
+    ),
+    (ThesisType.TRANSMISSION, 0, "行业景气度"): (
+        "limitation",
+        "",
+        "外部变量被明确为「行业景气度」。这类变量本身缺少可观测定义，"
+        "是本产品判该命题无法验证的直接原因之一；确认这一取值会让「需要什么数据」"
+        "写得更准确，而不是改变结论。",
+    ),
+    (ThesisType.TRANSMISSION, 1, "一个季度内"): (
+        "limitation",
+        "",
+        "传导时滞被设定为「一个季度内」。本轮子问题取的是最近若干报告期，"
+        "窗口已覆盖该时滞；结论的适用边界会写明：若一个季度内成本端未见变化，"
+        "在本设定下即构成对传导链的证伪。",
+    ),
+    (ThesisType.TRANSMISSION, 1, "半年内"): (
+        "none",
+        "",
+        "与产品默认观察窗一致（2 个报告期），下游取数与判定不变。",
+    ),
+    (ThesisType.TRANSMISSION, 1, "一年以上"): (
+        "limitation",
+        "",
+        "传导时滞被设定为「一年以上」。本轮的观察窗没有覆盖该时滞，"
+        "因此「现在看不到效果」在本设定下不构成证伪，这会写入结论的适用边界 —— "
+        "否则读者会把「尚未传导到」误读成「不会传导」。",
+    ),
+    (ThesisType.TRANSMISSION, 2, "上游"): (
+        "unverifiable",
+        "SQ-01",
+        "用户把标的在链条中的位置断言为「上游」。该位置需要主营构成来确认，"
+        "而扶摇公开接口不提供分部收入，本产品无法核实该断言。"
+        "SQ-01 因此判为无法验证，且结论会声明：链条位置由用户断言、未经核实。",
+    ),
+    (ThesisType.TRANSMISSION, 2, "中游"): (
+        "unverifiable",
+        "SQ-01",
+        "用户把标的在链条中的位置断言为「中游」。同上：主营构成不可得，该断言无法核实，"
+        "SQ-01 判为无法验证，链条位置在结论中标注为「用户断言、未经核实」。",
+    ),
+    (ThesisType.TRANSMISSION, 2, "下游"): (
+        "unverifiable",
+        "SQ-01",
+        "用户把标的在链条中的位置断言为「下游」。同上：主营构成不可得，该断言无法核实，"
+        "SQ-01 判为无法验证，链条位置在结论中标注为「用户断言、未经核实」。",
+    ),
+    (ThesisType.TRANSMISSION, 2, "不确定"): (
+        "none",
+        "",
+        "与产品默认处理一致：不做默认假设，直接检验主营构成是否可得，下游不变。",
+    ),
+}
+
+_CUSTOM_ANSWER_IMPACT = (
+    "该回答不在本问题的预设选项内。本产品把它原样写进 v2 的前提，"
+    "但**不会**据此改动任何子问题的取数与判定 —— 自定义口径没有对应的数据与判据，"
+    "硬套一个近似口径，比承认做不到更危险。"
+)
+
+
+def _lookup_effect(
+    ttype: ThesisType, idx: int, answer: str
+) -> tuple[str, str, str]:
+    """查这张表。查不到说明选项与本表不同步——那时宁可当无效果，也不猜一个效果出来。"""
+    return ANSWER_EFFECTS.get((ttype, idx, answer), ("none", "", _CUSTOM_ANSWER_IMPACT))
+
+
+def _clarifications(
+    ttype: ThesisType, answers: Optional[dict[str, str]] = None
+) -> list[ClarificationQuestion]:
+    """构造澄清问题。
+
+    用户答了就用用户的原话（`answer`），没答才落回默认假设（`assumption`）。
+    未回答路径必须与引入本功能之前逐字相同 —— 它同时是四条例题的既定行为，
+    悄悄改掉默认假设等于改掉了例题的结论。
+    """
+    answers = answers or {}
+    out: list[ClarificationQuestion] = []
+    for idx, (q, why, opts, default) in enumerate(CLARIFY[ttype]):
+        given = (answers.get(q) or "").strip()
+        if not given:
+            out.append(
+                ClarificationQuestion(
+                    question=q,
+                    why_it_matters=why,
+                    options=opts,
+                    assumption=f"用户未指定时，本产品采用：{default}。该假设会随结论一并展示，"
+                               f"并可在界面上修改后重跑。",
+                )
+            )
+            continue
+        kind, _, text = _lookup_effect(ttype, idx, given)
+        out.append(
+            ClarificationQuestion(
+                question=q,
+                why_it_matters=why,
+                options=opts,
+                assumption=f"由用户在澄清环节指定：{given}。",
+                answer=given,
+                impact=text if kind != "none" else (text or "与本产品默认取值一致，下游不变。"),
+            )
         )
-        for q, why, opts, default in CLARIFY[ttype]
-    ]
+    return out
 
 
 def _revise(
@@ -286,18 +519,32 @@ def _revise(
         decision_context="由用户原始输入直接记录，未做任何加工。",
     )
 
-    assumptions = "；".join(c.assumption.split("：", 1)[-1].rstrip("。") for c in clarifications)
+    # 前提取自哪里必须分开写：用户答的取 answer，未答的才从默认假设的文案里截。
+    # 早先一律靠 `split("：", 1)[-1]` 从 assumption 里截，回答里只要有一个全角冒号
+    # （例如「与同业比：沪深300」），截出来就只剩冒号后面的半句——v2 会悄悄丢掉用户的前半句。
+    def _premise(c: ClarificationQuestion) -> str:
+        if c.answer:
+            return c.answer
+        return c.assumption.split("：", 1)[-1].rstrip("。")
+
+    assumptions = "；".join(_premise(c) for c in clarifications)
     tightened = (
         f"关于 {subject}，在「{horizon}」的时间窗内，"
         f"{raw.strip().rstrip('。')}。"
         f"（本命题的可验证化前提：{assumptions}）"
+    )
+    n_answered = sum(1 for c in clarifications if c.answer)
+    source = (
+        f"其中 {n_answered} 条前提由用户在澄清环节指定，其余由本产品补全"
+        if n_answered
+        else "上述前提由本产品在澄清环节自动补全"
     )
     v2 = ThesisVersion(
         version="v2",
         text=tightened,
         horizon=horizon,
         decision_context=(
-            f"命题类型判定为「{ttype.value}」。上述前提由本产品在澄清环节自动补全，"
+            f"命题类型判定为「{ttype.value}」。{source}，"
             f"目的是把原命题中隐含的、无法证伪的部分显式化——"
             f"不明确参照系与口径，任何「验证」都只是自说自话。"
         ),
@@ -395,15 +642,22 @@ def llm_available() -> bool:
 
 def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
                  resolved_name: Optional[str] = None,
-                 thscode: Optional[str] = None) -> ParsedThesis:
-    """解析命题。优先 LLM，失败或无凭据时退回规则引擎。"""
+                 thscode: Optional[str] = None,
+                 answers: Optional[dict[str, str]] = None) -> ParsedThesis:
+    """解析命题。优先 LLM，失败或无凭据时退回规则引擎。
+
+    `answers` 是用户在澄清环节给出的回答，键为澄清问题原文。
+    带回答重跑时**不采用 LLM 生成的澄清问题**：回答是按上一轮界面上显示的问题填的，
+    而 LLM 每次生成的问题不可复现，一旦换了一套问题，回答就会静默地对不上任何一条 ——
+    「用户答了但产品没听见」比「不让答」更糟。类型判定仍可走 LLM。
+    """
     code, nm = _detect_subject(raw)
     ticker = resolved_ticker or code
     name = resolved_name or nm
 
     ttype, rationale = _detect_type(raw)
     horizon = _detect_horizon(raw)
-    clar = _clarifications(ttype)
+    clar = _clarifications(ttype, answers)
     engine = "规则引擎"
 
     if llm_available():
@@ -426,7 +680,7 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
                     else:
                         name = s
                 amb = got.get("ambiguities") or []
-                if amb:
+                if amb and not answers:
                     clar = [
                         ClarificationQuestion(
                             question=a.get("question", ""),

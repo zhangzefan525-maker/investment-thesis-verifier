@@ -57,6 +57,11 @@ class VerifyRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="股票简称，可留空由命题中提取")
     thscode: Optional[str] = Field(default=None, description="完整代码如 600519.SH，优先使用")
     prefer_live: bool = Field(default=True, description="是否优先使用实时接口")
+    clarifications: dict[str, str] = Field(
+        default_factory=dict,
+        description="对澄清问题的回答，键为问题原文、值为用户选定的选项。"
+        "留空表示不回答，走产品默认假设——默认路径的行为与引入该字段前完全一致",
+    )
 
 
 @app.get("/api/health")
@@ -100,6 +105,7 @@ def verify(req: VerifyRequest) -> ThesisVerification:
         provider=provider,
         data_mode=mode,
         data_mode_note=note,
+        answers=req.clarifications,
     )
     RUNS[result.run_id] = result
     return result

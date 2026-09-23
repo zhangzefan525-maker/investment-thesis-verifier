@@ -40,27 +40,40 @@ export default function App() {
       .catch((e) => setHealth({ status: 'unreachable', _error: String(e) }))
   }, [])
 
-  const submit = useCallback(async () => {
-    if (!text.trim() || loading) return
-    setLoading(true)
-    setError(null)
-    setRun(null)
-    try {
-      const r = await fetch(api('/api/verify'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ raw_text: text.trim() }),
-      })
-      const body = await r.json()
-      if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`)
-      setRun(body)
-      setActive('conclusion')
-    } catch (e) {
-      setError(String(e.message || e))
-    } finally {
-      setLoading(false)
-    }
-  }, [text, loading])
+  // `given` 是对澄清问题的回答。空对象 = 不回答，走产品默认假设，
+  // 与引入这个参数之前的请求体完全一致。
+  const verify = useCallback(
+    async (given = {}, { keepPrevious = false } = {}) => {
+      if (!text.trim() || loading) return
+      setLoading(true)
+      setError(null)
+      // 首次验证时清空旧结果；按回答重跑时保留，否则整页闪一下白，
+      // 用户会以为自己点了「清空」。
+      if (!keepPrevious) setRun(null)
+      try {
+        const r = await fetch(api('/api/verify'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ raw_text: text.trim(), clarifications: given }),
+        })
+        const body = await r.json()
+        if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`)
+        setRun(body)
+        setActive('conclusion')
+      } catch (e) {
+        setError(String(e.message || e))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [text, loading],
+  )
+
+  const submit = useCallback(() => verify({}), [verify])
+  const rerunWithAnswers = useCallback(
+    (given) => verify(given, { keepPrevious: true }),
+    [verify],
+  )
 
   // 每个区块只在下游真的有内容时才渲染——空区块比没区块更让人困惑。
   const visible = useMemo(() => {
@@ -117,7 +130,7 @@ export default function App() {
               <FalsificationTable run={run} />
               <ResearchPanel run={run} />
               <FailurePanel run={run} />
-              <ParsedPanel run={run} />
+              <ParsedPanel run={run} onRerun={rerunWithAnswers} busy={loading} />
             </div>
           </>
         )}

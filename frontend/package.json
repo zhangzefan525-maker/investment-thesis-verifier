@@ -8,6 +8,7 @@
     "clean:dist": "node scripts/clean-dist.mjs",
     "build": "node scripts/clean-dist.mjs && vite build",
     "ui:smoke": "node scripts/ui-smoke.mjs",
+    "ui:clarify": "node scripts/clarify-smoke.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

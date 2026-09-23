@@ -14,6 +14,7 @@ from typing import Optional
 from ..providers.base import DataProvider, Err
 from ..providers.fuyao import FuyaoClient, credential_status
 from ..schemas import (
+    ClarificationQuestion,
     Confidence,
     DecompositionLayer,
     DecompositionResult,
@@ -36,7 +37,7 @@ from .executors import (
     TRANSMISSION_EXECUTORS,
     Ctx,
 )
-from .parse import _detect_subject, _subject_candidates, parse_thesis
+from .parse import _detect_subject, _lookup_effect, _subject_candidates, parse_thesis
 from .pipeline import AggregateInput, aggregate, build_charts, detect_conflicts
 
 EXECUTOR_SETS = {
@@ -165,6 +166,122 @@ def build_decomposition(parsed: ParsedThesis) -> DecompositionResult:
     )
 
 
+def _answer_unverifiable_evidence(
+    parsed: ParsedThesis, sq_id: str, c: ClarificationQuestion
+) -> Evidence:
+    """按用户在澄清环节指定的口径，把一条子问题改判为「无法验证」。
+
+    与「取数失败」必须分开：数据源没有任何问题，是用户问的那个口径本产品做不到。
+    混为一谈的话，读者会以为重试一次、或者换个网络就有了。
+    """
+    tmpl = TEMPLATES[parsed.thesis_type]
+    sq = next((s for s in tmpl.sub_questions if s.id == sq_id), None)
+    return Evidence(
+        id=f"EV-{sq_id}",
+        sub_question_id=sq_id,
+        claim=f"该子问题无法按用户在澄清环节指定的口径回答：{c.answer}",
+        value=None,
+        display_value="口径不可得",
+        provenance=Provenance(
+            source="本产品澄清环节",
+            endpoint="(clarification: 用户在界面上指定的口径，非接口调用)",
+            report_period="—",
+            caliber=f"用户指定：{c.answer}",
+            unit="—",
+            raw={"question": c.question, "answer": c.answer},
+        ),
+        decision_rule_applied=sq.text if sq else sq_id,
+        threshold_applied="—",
+        verdict=Verdict.UNVERIFIABLE,
+        # 高置信度：这不是「拿不准」，而是确定地做不到。给它低置信度会误导读者以为
+        # 换个数据源重试就有结果。
+        confidence=Confidence.HIGH,
+        reasoning=c.impact,
+        fact_or_logic="logic",
+        unverifiable=UnverifiableDetail(
+            category=UnverifiableCategory.DATA_NOT_EXIST,
+            what_is_needed=c.impact,
+            where_to_get=(
+                "扶摇公开接口（fuyao.aicubes.cn）当前不提供该口径所需的数据，"
+                "本产品亦未接入替代数据源。接入后重跑本命题即可覆盖该子问题"
+            ),
+            failure_evidence=(
+                f"澄清环节用户把口径指定为「{c.answer}」，"
+                f"而本轮取数范围不覆盖该口径；本子问题按约束改判为无法验证，未用近似口径顶替"
+            ),
+        ),
+    )
+
+
+def apply_answer_effects(
+    parsed: ParsedThesis,
+    decomposition: DecompositionResult,
+    evidence: list[Evidence],
+) -> tuple[DecompositionResult, list[Evidence], list[str], list[str]]:
+    """把澄清回答落到子问题上，返回 (拆解, 证据, 追加的边界声明, 影响流水)。
+
+    回答不落到下游就是装饰。这里只执行 `parse.ANSWER_EFFECTS` 里声明过的动作，
+    不在执行期临时发明新的影响 —— 说明文字与实际行为同源于那张表，
+    改一处不会只改到一半（早先的写法是文案里写「可修改后重跑」，而根本没有那个控件）。
+
+    未回答时不做任何事，返回值与输入逐字相同：四条例题的既定行为不能被这个功能改动。
+    """
+    extra_limitations: list[str] = []
+    journal: list[str] = []
+
+    subs = list(decomposition.sub_questions)
+    ev = list(evidence)
+    skipped = list(decomposition.skipped_layers)
+    reasons = dict(decomposition.skipped_layer_reasons)
+
+    for idx, c in enumerate(parsed.clarifications):
+        if not c.answer:
+            continue
+        kind, target, text = _lookup_effect(parsed.thesis_type, idx, c.answer)
+
+        if kind == "limitation":
+            extra_limitations.append(text)
+            journal.append(f"[{c.question}] → 追加适用边界：{c.answer}")
+        elif kind == "unverifiable":
+            ev = [e for e in ev if e.sub_question_id != target]
+            ev.append(_answer_unverifiable_evidence(parsed, target, c))
+            journal.append(f"[{c.question}] → {target} 改判为无法验证：{c.answer}")
+        elif kind == "drop":
+            layer = next(
+                (
+                    s.layer
+                    for s in TEMPLATES[parsed.thesis_type].sub_questions
+                    if s.id == target
+                ),
+                None,
+            )
+            subs = [s for s in subs if s.id != target]
+            ev = [e for e in ev if e.sub_question_id != target]
+            if layer is not None and layer not in skipped:
+                skipped.append(layer)
+                # 跳过原因要写明是「谁让它跳过的」。只写「本层做不到」，
+                # 读者会以为这个缺口本来就存在 —— 而它是这次澄清回答新引入的。
+                reasons[layer.value] = f"由澄清回答「{c.answer}」触发：{text}"
+            journal.append(f"[{c.question}] → {target} 移出本轮范围：{c.answer}")
+        # kind == "none"：用户的选择与产品默认一致，下游不变。
+
+    if not journal:
+        return decomposition, evidence, [], []
+
+    return (
+        DecompositionResult(
+            sub_questions=subs,
+            unable_to_decompose=decomposition.unable_to_decompose,
+            skipped_layers=skipped,
+            skipped_layer_reasons=reasons,
+            generated_by=decomposition.generated_by,
+        ),
+        ev,
+        extra_limitations,
+        journal,
+    )
+
+
 def execute_evidence(ctx: Ctx, parsed: ParsedThesis) -> list[Evidence]:
     execs = EXECUTOR_SETS[parsed.thesis_type]
     out: list[Evidence] = []
@@ -217,8 +334,12 @@ def run_verification(
     provider: Optional[DataProvider] = None,
     data_mode: Optional[str] = None,
     data_mode_note: Optional[str] = None,
+    answers: Optional[dict[str, str]] = None,
 ) -> ThesisVerification:
-    """跑一次完整的命题验证。"""
+    """跑一次完整的命题验证。
+
+    `answers` 是用户对澄清问题的回答，键为问题原文。为空时全链路行为与引入该参数前逐字相同。
+    """
     run_id = f"RUN-{uuid.uuid4().hex[:10]}"
 
     if provider is None:
@@ -275,7 +396,13 @@ def run_verification(
             _, name = _detect_subject(raw_text)
 
     # 2) 命题解析
-    parsed = parse_thesis(raw_text, resolved_ticker=ticker, resolved_name=name, thscode=thscode)
+    parsed = parse_thesis(
+        raw_text,
+        resolved_ticker=ticker,
+        resolved_name=name,
+        thscode=thscode,
+        answers=answers,
+    )
 
     if not thscode:
         return ThesisVerification(
@@ -302,6 +429,13 @@ def run_verification(
     # 只收集 collect 阶段的错误会让执行期的失败静默消失
     errors.extend(x for x in ctx.run_errors if x not in errors)
 
+    # 5.5) 澄清回答落地。必须发生在冲突检测与聚合之前 ——
+    # 改判过的子问题要参与冲突检测，边界声明要进结论，晚了就等于没改。
+    decomposition, evidence, extra_limitations, answer_journal = apply_answer_effects(
+        parsed, decomposition, evidence
+    )
+    errors.extend(answer_journal)
+
     # 6) 冲突检测
     conflicts = detect_conflicts(ctx, evidence, parsed.thesis_type)
 
@@ -315,6 +449,7 @@ def run_verification(
             raw_text=raw_text,
             ticker=ctx.ticker,
             name=ctx.name,
+            extra_limitations=extra_limitations,
         ),
     )
 

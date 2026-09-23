@@ -237,6 +237,8 @@ class AggregateInput:
     raw_text: str
     ticker: str
     name: str
+    extra_limitations: list[str] = field(default_factory=list)
+    """澄清回答带来的额外适用边界。默认空 —— 没有回答时聚合结果与引入该功能前逐字相同。"""
 
 
 def aggregate(
@@ -267,6 +269,9 @@ def aggregate(
             f"本次运行有 {len(ctx.run_errors)} 条取数异常已记录在「失败透明」清单中，"
             f"相关子问题已判定为无法验证，未被静默跳过。"
         )
+    # 澄清回答带来的边界声明。放在最后：它解释的是「以上这些证据该怎么读」，
+    # 不是又一条取数口径说明。
+    limitations.extend(meta.extra_limitations)
 
     return Conclusion(
         verdict=verdict,
@@ -295,9 +300,16 @@ def _decide(
         return e.verdict if e else None
 
     if ttype is ThesisType.DIVERGENCE:
+        # 子问题可能因澄清回答被移出本轮范围（例如用户把命题收窄为「仅收入与利润」，
+        # SQ-05 被 drop）。下面每句结论文案都按**实际在场的**子问题来写，
+        # 而不是假设三条基本面子问题一定都跑过 —— 否则文案会替一条没跑的证据说话。
+        FUND_IDS = ("SQ-03", "SQ-04", "SQ-05")
+        FUND_NAME = {"SQ-03": "收入", "SQ-04": "利润", "SQ-05": "盈利质量"}
+        present_fund = [s for s in FUND_IDS if by_id.get(s) is not None]
+
         val_side = v("SQ-01")
         price_side = v("SQ-02")
-        fund_side = [v(s) for s in ("SQ-03", "SQ-04", "SQ-05")]
+        fund_side = [v(s) for s in FUND_IDS]
 
         val_ok = val_side is Verdict.SUPPORT
         fund_ref = any(x is Verdict.REFUTE for x in fund_side)
@@ -312,21 +324,51 @@ def _decide(
                 "已完整检验估值侧与基本面侧；由于命题前提不成立，基本面侧证据不作为结论依据。",
             )
         if fund_ref:
-            losers = [s for s in ("SQ-03", "SQ-04", "SQ-05") if v(s) is Verdict.REFUTE]
+            losers = [s for s in FUND_IDS if v(s) is Verdict.REFUTE]
+            val_clause = (
+                "虽然估值侧成立，但"
+                if val_ok
+                else "估值侧未获支持（该侧子问题本轮无法验证），但"
+            )
             return (
                 Verdict.REFUTE,
-                f"现有证据**不支持**该命题。虽然估值侧成立，但基本面侧已被证伪："
+                f"现有证据**不支持**该命题。{val_clause}基本面侧已被证伪："
                 f"{'、'.join(losers)} 显示公司经营确有恶化。"
                 f"「估值回落但基本面未恶化」的两个条件未能同时满足。",
-                "估值侧与基本面侧均已检验；命题被基本面侧单独证伪。",
+                (
+                    "估值侧与基本面侧均已检验；命题被基本面侧单独证伪。"
+                    if val_ok
+                    else "估值侧落入无法验证，但基本面侧自身已足以证伪命题，"
+                         "结论不以估值侧为转移。"
+                ),
+            )
+        if not val_ok and not fund_ref and not fund_unknown:
+            # 估值侧本身取不到数 —— 结论卡在这里，而不是卡在基本面。
+            # 若沿用下面那条「N 条基本面证据落入无法验证」的文案，N 会是 0，读出来是句废话。
+            e1 = by_id.get("SQ-01")
+            why = (
+                e1.unverifiable.what_is_needed
+                if (e1 is not None and e1.unverifiable is not None)
+                else "该侧所需数据不在本产品的取数范围内"
+            )
+            return (
+                Verdict.UNVERIFIABLE,
+                f"现有证据**不足**以支持或否定该命题。基本面侧未见恶化，"
+                f"但命题的前半句「估值已回落」本轮无法验证：{why}。"
+                f"按本产品规则，命题的一端取不到数时不给出方向性结论 —— "
+                f"把无法验证的那一侧当作成立，等于替用户的假设背书。",
+                "命题未被完整覆盖：估值侧落入无法验证，基本面侧证据不作为结论依据。",
             )
         if val_ok and not fund_ref and not fund_unknown:
+            names = "、".join(FUND_NAME[s] for s in present_fund)
+            tail = "三项均未见恶化" if len(present_fund) == 3 else "各项均未见恶化"
+            n_val = sum(1 for s in ("SQ-01", "SQ-02") if by_id.get(s) is not None)
             return (
                 Verdict.SUPPORT,
                 f"现有证据**支持**该命题。{label} 的估值确已回落（重建 PE 处于自身历史低分位），"
-                f"而收入、利润与盈利质量三项均未见恶化。需注意：本结论的适用边界受周期性检测结果约束，"
+                f"而{names}{tail}。需注意：本结论的适用边界受周期性检测结果约束，"
                 f"详见冲突与反转条件。",
-                "命题两侧（估值侧 2 条、基本面侧 3 条）均有可用证据支撑。",
+                f"命题两侧（估值侧 {n_val} 条、基本面侧 {len(present_fund)} 条）均有可用证据支撑。",
             )
         return (
             Verdict.UNVERIFIABLE,

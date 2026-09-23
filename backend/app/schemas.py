@@ -142,12 +142,25 @@ class UnverifiableDetail(BaseModel):
 
 
 class ClarificationQuestion(BaseModel):
-    """澄清问题。原命题通常是模糊的，必须先问清才能验证。"""
+    """澄清问题。原命题通常是模糊的，必须先问清才能验证。
+
+    这是 v1 → v2 修订的输入端：用户答了，v2 的前提就是用户的原话；
+    没答，v2 的前提才是本产品的默认假设。两者必须能分辨，所以 `answer`
+    与 `assumption` 分开存，而不是把回答也塞进 assumption 里。
+    """
 
     question: str
     why_it_matters: str = Field(description="这个问题不清楚会导致哪条子问题无法判定")
     options: list[str] = Field(default_factory=list)
     assumption: str = Field(description="用户未回答时本产品采用的默认假设——必须写明而不是暗含")
+    answer: Optional[str] = Field(
+        default=None, description="用户在澄清环节给出的回答。为 None 表示未回答，此时走 assumption"
+    )
+    impact: str = Field(
+        default="",
+        description="该回答对本轮验证产生的**实际**影响。回答了就必须说明它改了什么；"
+        "若它不改变任何取数与判定，也要如实写「不改变下游」——不允许用模糊措辞把无效果说成有效果",
+    )
 
 
 class ThesisVersion(BaseModel):

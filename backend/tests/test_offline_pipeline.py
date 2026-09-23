@@ -95,6 +95,8 @@ MARKDOWN_FIELDS = {
     "question",             # clarifications[].question
     "why_it_matters",
     "assumption",
+    "answer",               # clarifications[].answer（用户在澄清环节的原话）
+    "impact",               # clarifications[].impact（该回答改变了下游什么）
     "what_is_needed",       # unverifiable.*
     "where_to_get",
     "failure_evidence",
