@@ -37,7 +37,13 @@ from .executors import (
     TRANSMISSION_EXECUTORS,
     Ctx,
 )
-from .parse import _detect_subject, _lookup_effect, _subject_candidates, parse_thesis
+from .parse import (
+    _detect_subject,
+    _detect_thscode,
+    _lookup_effect,
+    _subject_candidates,
+    parse_thesis,
+)
 from .pipeline import AggregateInput, aggregate, build_charts, detect_conflicts
 
 EXECUTOR_SETS = {
@@ -397,6 +403,14 @@ def run_verification(
 
     # 1) 标的消歧
     # 三种入口都要能走通：给了 thscode / 给了代码或名称 / 什么都没给（只有一句自然语言命题）。
+    # 命题里写全了带后缀的代码（600519.SH）时直接采信，不必再查一次检索接口。
+    # 这不是「猜后缀」——后缀是用户自己写出来的。
+    if not thscode:
+        full = _detect_thscode(raw_text)
+        if full:
+            thscode = full
+            ticker = ticker or full.split(".")[0]
+
     # 最后一种从前端来，最常见——先从命题里抽主体，再交给检索接口消歧。
     # 即便已给出 thscode，也补一次名称：缺 name 会让解析器退回关键词抽取。
     if not thscode or not name:
@@ -413,7 +427,11 @@ def run_verification(
         # 句首切分覆盖「中国平安估值已经回落…」这类没有「的」的句式，二者互补。
         if not queries:
             queries = list(_subject_candidates(raw_text))
-            _, head_name = _detect_subject(raw_text)
+            det_code, head_name = _detect_subject(raw_text)
+            # 命题里只写了 6 位裸代码时，也把它交给检索接口去查一次——
+            # 这是**查**（接口按代码返回带后缀的 thscode），不是**猜**后缀。
+            if det_code and det_code not in queries:
+                queries.insert(0, det_code)
             if head_name and head_name not in queries:
                 queries.append(head_name)
             queries = queries or [None]
@@ -433,11 +451,16 @@ def run_verification(
                 break
             tried.append(q)
         else:
-            errors.append(
-                f"未能确定标的的完整 thscode，取数与验证无法开始。"
-                f"已尝试的候选：{'、'.join(tried) or '（命题中未识别出任何候选）'}。"
-                f"请在命题中直接写明六位股票代码或带交易所后缀的代码（如 600519.SH）以避免歧义。"
-            )
+            # 标的已经确定（命题里写全了代码）时，没查到名称不是失败——
+            # 此前这里无条件报「未能确定标的」，于是「写全了代码」的命题
+            # 会一边跑出结论、一边挂着一条自相矛盾的失败。
+            if not thscode:
+                errors.append(
+                    f"未能确定标的的完整 thscode，取数与验证无法开始。"
+                    f"已尝试的候选：{'、'.join(tried) or '（命题中未识别出任何候选）'}。"
+                    f"请在命题中写明带交易所后缀的代码（如 600519.SH / 000001.SZ / 832000.BJ）"
+                    f"以避免歧义。"
+                )
         if not thscode and not ticker and not name:
             _, name = _detect_subject(raw_text)
 

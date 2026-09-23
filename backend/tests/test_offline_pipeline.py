@@ -1062,3 +1062,39 @@ def test_valuation_chart_footer_window_comes_from_the_series(offline_runs, cid):
         f"{cid} 的窗口 {win} 与曲线的首尾点 {first} ~ {last} 不一致——"
         f"页脚要印的窗口必须取自曲线本身"
     )
+
+
+# --------------------------------------------------------------------------
+# 命题里写全了带后缀的代码
+#
+# 线上实测出过的一次 500：`我认为贵州茅台（600519.SH）的估值已经回落…` 直接 500，
+# 去掉括号里那段代码的同一句话 200。根因是解析层不带后缀（见 test_parse.py 那一组）。
+# 这里守的是全链路：写全了代码就该一路跑到结论，而且不许掺进「未能确定标的」的噪声。
+# --------------------------------------------------------------------------
+
+THSCODE_IN_TEXT = "我认为贵州茅台（600519.SH）的估值已经回落，但基本面并没有恶化"
+BARE_CODE_IN_TEXT = "我认为 600887 的估值已经回落，但基本面并没有恶化"
+
+
+def test_thesis_with_full_code_runs_end_to_end():
+    from tests.conftest import run_offline
+
+    tv = run_offline(THSCODE_IN_TEXT)
+    assert tv.parsed.thscode == "600519.SH"
+    assert tv.conclusion is not None, "写全了代码却没能形成结论"
+    assert not [e for e in tv.errors if "未能确定标的" in e], (
+        f"代码已经写全，不该再报「未能确定标的」：{tv.errors}"
+    )
+    assert tv.evidence, "写全了代码却一条证据都没有"
+
+
+def test_bare_code_reports_a_graceful_failure_instead_of_raising():
+    """只有裸代码时：不崩、不猜后缀、如实说明要写成什么样。"""
+    from tests.conftest import run_offline
+
+    tv = run_offline(BARE_CODE_IN_TEXT)
+    assert tv.conclusion is None
+    assert tv.parsed.thscode is None
+    assert any("交易所后缀" in e for e in tv.errors), (
+        f"失败必须说清下一步该怎么写：{tv.errors}"
+    )

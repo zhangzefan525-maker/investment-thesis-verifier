@@ -61,6 +61,8 @@ TYPE_KEYWORDS: dict[ThesisType, list[str]] = {
 # 注意：不能写 \b(\d{6})\b——Python 的 \w 在 str 模式下包含中文，
 # 「觉得600519」里「得」和「6」之间不构成词边界，正则匹配不到。已实测踩过。
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+# 写全了的代码：600519.SH / 000001.sz / 832000．BJ（全角点）
+_THSCODE_RE = re.compile(r"(?<!\d)(\d{6})\s*[.．]\s*(SH|SZ|BJ)(?![A-Za-z0-9])", re.IGNORECASE)
 _NAME_RE = re.compile(r"[「【]?([一-龥A-Za-z]{2,8})[」】]?")
 
 HORIZON_PATTERNS = [
@@ -114,6 +116,20 @@ _SUBJECT_NOISE = (
     "价格", "上涨", "下跌", "回落", "成本", "产能", "需求", "供给", "行业", "市场",
     "上涨", "下跌", "会挤", "可能", "应该", "是否", "来自", "已经", "没有", "并未",
 )
+
+
+def _detect_thscode(text: str) -> Optional[str]:
+    """命题里自己写了交易所后缀时直接采信——**这不是「猜后缀」**。
+
+    只有 6 位数字时返回 None：后缀一旦猜错，取的是一整套错标的的数据，
+    而错误会一路走到结论里；不认标的只是少跑一次，代价小得多。
+    这个区分是实测逼出来的（见 tests/test_parse.py 那一组）：
+    此前 `_detect_subject` 认出了那 6 位数字却丢掉了用户明明写出来的 `.SH`，
+    构造出 ticker 有值、thscode 为空的对象，撞上「不允许猜后缀」的校验器，
+    把一个本该是「如实说做不到」的场景变成了 HTTP 500。
+    """
+    m = _THSCODE_RE.search(text)
+    return f"{m.group(1)}.{m.group(2).upper()}" if m else None
 
 
 def _detect_subject(text: str) -> tuple[Optional[str], Optional[str]]:
@@ -728,6 +744,8 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
     并且对不上的回答一律记进 `unmatched_answers` 让前端说话，不再静默丢弃。
     """
     code, nm = _detect_subject(raw)
+    # 命题里写全了「600519.SH」就直接用，不必再查一遍
+    thscode = thscode or _detect_thscode(raw)
     ticker = resolved_ticker or code
     name = resolved_name or nm
 
@@ -793,6 +811,13 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
     unmatched = sorted({a for a in given_answers if a not in heard})
 
     v1, v2, diffs = _revise(ttype, raw, name or ticker or "该标的", horizon, clar)
+
+    # ParsedThesis 的约束「给了 ticker 就必须给 thscode」本身是对的（不许猜后缀），
+    # 但它不该被撞成异常：只有 6 位裸代码时**主动不认标的**，由 run.py 的消歧段
+    # 如实报出「未能确定标的」。线上实测出过这个 500——
+    # 命题写成「我认为 600887 的估值…」时异常直接穿到 API。
+    if ticker and not thscode:
+        ticker = None
 
     return ParsedThesis(
         raw_text=raw,
