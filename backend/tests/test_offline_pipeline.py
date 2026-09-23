@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -57,6 +58,62 @@ THRESHOLD_BASIS_MARKERS = (
     "支持区间",  # 三态判据的支持区间下沿
     "信息可得性",  # 非数值阈值，而是信息阈值
 )
+
+# 允许出现 `**粗体**` 的字段名。后端在这几个字段里用 markdown 强调关键词，
+# 前端对应的槽位必须走 RichText 组件渲染成 <strong>。
+#
+# 这份清单的意义在于：它是一道**双向**的闸门。字段名不在表里却带了 `**`
+# → 测试失败，说明这条文案会以「成本率必须**上升**」的形式原样漏给读者；
+# 表里的字段前端漏接 RichText → UI 冒烟脚本的 `**` 扫描会抓住。
+# 两边任何一侧失守都有测试打红，不靠改代码的人记得。
+MARKDOWN_FIELDS = {
+    "statement",            # conclusion.statement
+    "coverage_note",
+    "disclaimer",
+    "limitations",
+    "nature",               # conflicts[].nature / resolution / residual_uncertainty
+    "resolution",
+    "residual_uncertainty",
+    "reasoning",            # evidence[].reasoning
+    "claim",                # evidence[].claim
+    "decision_rule_applied",
+    "threshold_applied",
+    "text",                 # sub_questions[].text / parsed.v1.text / parsed.v2.text
+    "decision_rule",        # sub_questions[].decision_rule
+    "metric",               # sub_questions[].metric
+    "data_source",          # sub_questions[].data_source
+    "time_window",          # sub_questions[].time_window
+    "rationale",            # sub_questions[].rationale
+    "threshold_basis",      # falsification_conditions[].*
+    "monitored_variable",
+    "trigger_threshold",
+    "flips_sub_question",
+    "type_rationale",       # parsed.type_rationale
+    "reason",               # parsed.diffs[].reason
+    "before",               # parsed.diffs[].before / .after
+    "after",
+    "question",             # clarifications[].question
+    "why_it_matters",
+    "assumption",
+    "what_is_needed",       # unverifiable.*
+    "where_to_get",
+    "failure_evidence",
+    "skipped_layer_reasons",
+    "errors",               # 顶层失败清单
+}
+
+
+def _walk_markdown_paths(node, path=()):
+    """递归收集所有含 `**` 的字符串，回报它的 JSON 路径。"""
+    if isinstance(node, str):
+        if "**" in node:
+            yield path, node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from _walk_markdown_paths(v, path + (str(k),))
+    elif isinstance(node, (list, tuple)):
+        for i, v in enumerate(node):
+            yield from _walk_markdown_paths(v, path + (f"[{i}]",))
 
 
 # ==========================================================================
@@ -567,7 +624,62 @@ def test_captured_fixtures_are_available(provider):
 
 
 # ==========================================================================
-# 第 6 层：合规边界
+# 第 6 层：渲染契约
+# ==========================================================================
+
+
+@pytest.mark.parametrize("cid", ALL_CASES)
+def test_markdown_emphasis_stays_inside_rendered_fields(offline_runs, cid):
+    """带 `**` 的文案只能出现在前端走 RichText 渲染的字段里。
+
+    这条测试是一次真实泄漏逼出来的：传导型命题的判定规则里写着
+    「成本率必须**上升**且毛利率下降 >1pp」，而拆解面板当时是裸渲染 `{s.decision_rule}`，
+    于是屏幕上原样出现了两个星号。后端写 markdown、前端不认识 markdown，
+    这种错不会报异常、不会让页面崩，只会静静地让读者看到一串符号。
+
+    所以这里守的不是「有没有 `**`」，而是「`**` 出现在哪」——
+    MARKDOWN_FIELDS 之外的任何位置带着 `**` 都是 bug，
+    要么把文案里的星号去掉，要么把那个槽位接上 RichText。
+    """
+    payload = offline_runs[cid].model_dump()
+    offenders = []
+    for path, text in _walk_markdown_paths(payload):
+        # 路径最后一节是字段名；数组下标形如 "[0]"，往回找最近的非下标节点
+        field = next((p for p in reversed(path) if not p.startswith("[")), "")
+        if field not in MARKDOWN_FIELDS:
+            offenders.append((".".join(path), text[:70]))
+    assert not offenders, (
+        f"{cid} 以下字段带 `**` 但不在 MARKDOWN_FIELDS 里，前端不会渲染它，"
+        f"读者会看到星号本身：\n" + "\n".join(f"  {p} → {t}" for p, t in offenders)
+    )
+
+
+def test_markdown_fields_all_appear_in_frontend_source():
+    """清单里的每个字段，前端源码里必须真的提到过。
+
+    这条守的是清单的另一侧：MARKDOWN_FIELDS 允许字段携带 `**`，
+    而这个许可只有在「前端确实会渲染它」时才成立。一个前端根本没读过的字段
+    留在清单里，等于给未来的文案开了一张空头支票——
+    上面那条正向测试会放它过去，读者却在屏幕上看到两个星号。
+
+    这里比对的是源码里出现过字段名，而不是 RichText 的调用点：
+    后者要解析 JSX，脆弱且容易误报；前者已经足够挡住「清单里写了、
+    前端压根没这个字段」这类失守，而真正会漏给读者的那类问题
+    由「正向测试 + UI 冒烟脚本的 DOM 扫描」两条一起兜住。
+    """
+    src_root = Path(__file__).resolve().parents[2] / "frontend" / "src"
+    assert src_root.is_dir(), f"找不到前端源码目录：{src_root}"
+    src = "\n".join(p.read_text(encoding="utf-8") for p in src_root.rglob("*.jsx"))
+
+    missing = sorted(f for f in MARKDOWN_FIELDS if f not in src)
+    assert not missing, (
+        f"MARKDOWN_FIELDS 里这些字段在前端源码中从未出现：{missing}。"
+        f"前端不渲染的字段不该出现在这里——它一旦真的带了 `**`，读者会看到星号本身。"
+    )
+
+
+# ==========================================================================
+# 第 7 层：合规边界
 # ==========================================================================
 
 
@@ -603,7 +715,7 @@ def test_limitations_disclose_the_rebuilt_caliber(offline_runs, cid):
 
 
 # ==========================================================================
-# 拆解结构：拆得出就要证得了
+# 第 8 层：拆解结构 —— 拆得出就要证得了
 # ==========================================================================
 
 

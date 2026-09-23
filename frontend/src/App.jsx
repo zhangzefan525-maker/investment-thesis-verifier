@@ -9,6 +9,7 @@ import ConclusionPanel from './components/ConclusionPanel.jsx'
 import FalsificationTable from './components/FalsificationTable.jsx'
 import FailurePanel from './components/FailurePanel.jsx'
 import Charts from './components/Charts.jsx'
+import ResearchPanel from './components/ResearchPanel.jsx'
 import RichText from './components/RichText.jsx'
 import { PRESETS } from './lib/ui.js'
 
@@ -19,6 +20,7 @@ const SECTIONS = [
   ['charts', '图表'],
   ['conflict', '冲突'],
   ['falsify', '反转条件'],
+  ['research', '继续用'],
   ['parse', '命题修订'],
 ]
 
@@ -112,6 +114,7 @@ export default function App() {
               <Charts run={run} />
               <ConflictPanel run={run} />
               <FalsificationTable run={run} />
+              <ResearchPanel run={run} />
               <FailurePanel run={run} />
               <ParsedPanel run={run} />
             </div>

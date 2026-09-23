@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "clean:dist": "node scripts/clean-dist.mjs",
+    "build": "node scripts/clean-dist.mjs && vite build",
+    "ui:smoke": "node scripts/ui-smoke.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

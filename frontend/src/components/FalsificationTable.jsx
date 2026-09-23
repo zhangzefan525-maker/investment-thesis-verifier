@@ -48,11 +48,17 @@ export default function FalsificationTable({ run }) {
                     onClick={() => setOpen(isOpen ? null : i)}
                     className="cursor-pointer hover:bg-ink-100/40"
                   >
-                    <td className="td font-medium text-ink-900">{f.monitored_variable}</td>
+                    <td className="td font-medium text-ink-900">
+                      <RichText text={f.monitored_variable} />
+                    </td>
                     <td className="td font-mono text-[11px]">{f.current_value}</td>
-                    <td className="td">{f.trigger_threshold}</td>
+                    <td className="td">
+                      <RichText text={f.trigger_threshold} />
+                    </td>
                     <td className="td text-[11px]">{f.direction}</td>
-                    <td className="td text-[11px]">{f.flips_sub_question}</td>
+                    <td className="td text-[11px]">
+                      <RichText text={f.flips_sub_question} />
+                    </td>
                     <td className="td">
                       <span
                         className={`chip border ${imp.cls}`}
@@ -67,9 +73,10 @@ export default function FalsificationTable({ run }) {
                     <tr className="bg-ink-100/50">
                       <td className="td" colSpan={7}>
                         <div className="label mb-1">阈值依据 —— 为什么是这个数</div>
-                        <p className="text-[12px] leading-relaxed text-ink-700">
-                          {f.threshold_basis}
-                        </p>
+                        <RichText
+                          className="block text-[12px] leading-relaxed text-ink-700"
+                          text={f.threshold_basis}
+                        />
                       </td>
                     </tr>
                   )}

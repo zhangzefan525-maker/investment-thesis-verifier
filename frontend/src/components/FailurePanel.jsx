@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import RichText from './RichText.jsx'
 
 export default function FailurePanel({ run }) {
   const errors = run.errors || []
@@ -34,7 +35,7 @@ export default function FailurePanel({ run }) {
           {errors.map((x, i) => (
             <li key={i} className="flex gap-2 text-[12px] leading-relaxed text-ref-fg">
               <span className="shrink-0 font-mono text-[10px] opacity-60">{i + 1}</span>
-              <span>{x}</span>
+              <RichText text={x} />
             </li>
           ))}
         </ul>

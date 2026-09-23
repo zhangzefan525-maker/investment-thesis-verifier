@@ -44,15 +44,18 @@ export default function ParsedPanel({ run }) {
                     <span className="font-mono text-[11px] text-ink-500">{d.field}</span>
                     <div className="mt-1 flex flex-wrap items-center gap-1.5">
                       <span className="rounded bg-ref-bg px-1.5 py-0.5 text-[11px] text-ref-fg line-through">
-                        {d.before || '（空）'}
+                        <RichText text={d.before || '（空）'} />
                       </span>
                       <span className="text-ink-300">→</span>
                       <span className="rounded bg-sup-bg px-1.5 py-0.5 text-[11px] text-sup-fg">
-                        {d.after || '（空）'}
+                        <RichText text={d.after || '（空）'} />
                       </span>
                     </div>
                   </div>
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-ink-500">{d.reason}</p>
+                  <RichText
+                    className="mt-1.5 block text-[11px] leading-relaxed text-ink-500"
+                    text={d.reason}
+                  />
                 </li>
               ))}
             </ul>
@@ -67,13 +70,16 @@ export default function ParsedPanel({ run }) {
             <ul className="space-y-2">
               {p.clarifications.map((c, i) => (
                 <li key={i} className="rounded-md bg-ink-100/60 px-3 py-2">
-                  <div className="text-[12px] font-medium text-ink-900">{c.question}</div>
+                  <RichText
+                    className="block text-[12px] font-medium text-ink-900"
+                    text={c.question}
+                  />
                   <div className="mt-1 text-[11px] leading-relaxed text-ink-500">
-                    为什么重要：{c.why_it_matters}
+                    为什么重要：<RichText text={c.why_it_matters} />
                   </div>
                   {c.assumption && (
                     <div className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-relaxed text-amber-800">
-                      默认假设：{c.assumption}
+                      默认假设：<RichText text={c.assumption} />
                     </div>
                   )}
                 </li>
@@ -99,10 +105,13 @@ function VersionBox({ title, body, sub, muted }) {
       }`}
     >
       <div className="label mb-1">{title}</div>
-      <p className={`text-[12px] leading-relaxed ${muted ? 'text-ink-500' : 'text-ink-900'}`}>
-        {body}
+      <RichText
+        className={`block text-[12px] leading-relaxed ${muted ? 'text-ink-500' : 'text-ink-900'}`}
+        text={body}
+      />
+      <p className="mt-1 text-[11px] text-ink-500">
+        时间窗：<RichText text={sub} />
       </p>
-      <p className="mt-1 text-[11px] text-ink-500">时间窗：{sub}</p>
     </div>
   )
 }

@@ -69,7 +69,7 @@ function EvidenceCard({ e }) {
       </div>
 
       <div className="card-pad flex-1 space-y-3">
-        <p className="text-[13px] font-medium leading-snug text-ink-900">{e.claim}</p>
+        <RichText className="block text-[13px] font-medium leading-snug text-ink-900" text={e.claim} />
 
         <p className="text-[12px] leading-relaxed text-ink-700">
           <RichText text={e.reasoning} />
@@ -128,7 +128,10 @@ function Row({ k, v, mono }) {
   return (
     <div className="flex gap-2">
       <dt className="kv-key w-[62px]">{k}</dt>
-      <dd className={`kv-val ${mono ? 'font-mono text-[11px]' : ''}`}>{v ?? '—'}</dd>
+      {/* 「无法验证」三问的答案来自执行器，措辞里可能带 **强调**，同样要走 RichText */}
+      <dd className={`kv-val ${mono ? 'font-mono text-[11px]' : ''}`}>
+        <RichText text={v ?? '—'} />
+      </dd>
     </div>
   )
 }

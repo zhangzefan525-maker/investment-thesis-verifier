@@ -40,18 +40,39 @@ export default function DecompositionPanel({ run }) {
                 <tr key={s.id} className="hover:bg-ink-100/40">
                   <td className="td font-mono text-[11px] text-ink-500">{s.id}</td>
                   <td className="td">
-                    <div className="text-ink-900">{s.text}</div>
-                    <div className="mt-1 text-[11px] text-ink-500">
-                      指标：{s.metric}
-                      {s.layer && (
-                        <span className="ml-2 rounded bg-ink-100 px-1.5 py-0.5">
-                          {LAYER_ZH[s.layer] || s.layer}
-                        </span>
-                      )}
+                    {/* 模板里的子问题正文与判定规则带 **强调**。这些字段过去是裸渲染的，
+                        于是「成本率必须**上升**」把星号原样显示给了读者——
+                        后端写的 markdown 与前端认得的 markdown 必须是一套。 */}
+                    <RichText className="block text-ink-900" text={s.text} />
+                    {/* 表头写着「五字段缺一不可」，那五字段就得真的都看得见。
+                        早先这里只显示了指标与判定规则，数据源、时间窗、以及
+                        「为什么这条能验证命题」都只存在于 JSON 里——
+                        读者无从判断这条子问题是不是拍脑袋想出来的。 */}
+                    <div className="mt-1 space-y-0.5 text-[11px] leading-relaxed text-ink-500">
+                      <div>
+                        指标：<RichText text={s.metric} />
+                        {s.layer && (
+                          <span className="ml-2 rounded bg-ink-100 px-1.5 py-0.5">
+                            {LAYER_ZH[s.layer] || s.layer}
+                          </span>
+                        )}
+                      </div>
+                      <div>
+                        数据源：<RichText text={s.data_source} />
+                      </div>
+                      <div>
+                        时间窗：<RichText text={s.time_window} />
+                      </div>
                     </div>
+                    {s.rationale && (
+                      <div className="mt-1.5 border-t border-dashed border-ink-300/70 pt-1.5 text-[11px] leading-relaxed text-ink-500">
+                        <span className="text-ink-700">为什么能验证：</span>
+                        <RichText text={s.rationale} />
+                      </div>
+                    )}
                   </td>
                   <td className="td">
-                    <div>{s.decision_rule}</div>
+                    <RichText className="block" text={s.decision_rule} />
                     <div className="mt-1 font-mono text-[11px] text-ink-500">{s.threshold}</div>
                   </td>
                   <td className="td">
