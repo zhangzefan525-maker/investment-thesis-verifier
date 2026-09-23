@@ -78,6 +78,55 @@ check('无 ** 泄漏', stars.length === 0, stars.join(' | '))
 
 check('零控制台错误', errors.length === 0, errors.slice(0, 2).join(' | '))
 
+// ---------------------------------------------------------------------------
+// 第二段：clarifications 没有选项时，面板不许说「可以在这里回答」
+//
+// 配了 ANTHROPIC_API_KEY 时，解析层会用 LLM 就本句命题生成临时追问，那些追问
+// options 为空 —— 它们不在预置问题表里，没有对应的取数与判据。此时面板若仍写着
+// 「可以在这里回答」「改动上面的选项后可以重跑」，用户读到的是一句承诺、
+// 屏幕上却一个可点的东西都没有。这与「并可在界面上修改后重跑」是同一类错。
+//
+// 这一段不吃 API key：拿一份真实返回改掉 options 再喂给页面，测的是真实渲染。
+// ---------------------------------------------------------------------------
+
+const live = await page.evaluate(async () => {
+  const r = await fetch('/api/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ raw_text: '我认为贵州茅台估值已经回落但基本面并没有恶化', clarifications: {} }),
+  })
+  return r.json()
+})
+for (const c of live.parsed.clarifications) {
+  c.options = []
+  c.answer = null
+  c.impact = ''
+}
+
+await page.unroute('**/api/verify').catch(() => {})
+await page.route('**/api/verify', (route) =>
+  route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(live) }),
+)
+
+await page.goto(BASE + '/', { waitUntil: 'networkidle' })
+await page.fill('textarea', '我认为贵州茅台估值已经回落但基本面并没有恶化')
+await page.getByRole('button', { name: /验证/ }).first().click()
+await page.waitForSelector('#conclusion', { timeout: 180000 })
+await page.locator('a[href="#parse"]').click()
+await page.waitForTimeout(500)
+
+const nogap = await page.locator('#parse').innerText()
+check('无选项时不再声称「可以在这里回答」', !nogap.includes('可以在这里回答'))
+check('无选项时不再说「改动上面的选项后可以重跑」', !nogap.includes('改动上面的选项后可以重跑'))
+check('无选项时说明为什么答不了', nogap.includes('本轮不能在这里作答'))
+check('逐条说明该问不在预置问题表内', nogap.includes('不在预置问题表内'))
+check(
+  '无选项时不渲染那个永远禁用的重跑按钮',
+  (await page.locator('#parse').getByRole('button', { name: /按我的回答重跑/ }).count()) === 0,
+)
+check('默认假设仍然明写', (await page.locator('#parse').getByText('默认假设：').count()) === 3)
+check('这一段无控制台错误', errors.length === 0, errors.slice(0, 2).join(' | '))
+
 await browser.close()
 console.log(failed ? `\n澄清环节验收：${failed} 项失败` : '\n澄清环节验收：全部通过')
 process.exit(failed ? 1 : 0)
