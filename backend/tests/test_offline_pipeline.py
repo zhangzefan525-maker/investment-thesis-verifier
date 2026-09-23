@@ -1098,3 +1098,16 @@ def test_bare_code_reports_a_graceful_failure_instead_of_raising():
     assert any("交易所后缀" in e for e in tv.errors), (
         f"失败必须说清下一步该怎么写：{tv.errors}"
     )
+
+
+def test_bare_code_reports_the_failure_once():
+    """同一次失败只报一条。
+
+    消歧段和它后面的兜底各自 append 过一条几乎一样的错误，界面上会顶出两条
+    「未能确定标的的完整 thscode，取数与验证无法开始」。
+    """
+    from tests.conftest import run_offline
+
+    tv = run_offline(BARE_CODE_IN_TEXT)
+    hits = [e for e in tv.errors if "未能确定标的" in e]
+    assert len(hits) == 1, f"同一次失败报了 {len(hits)} 条：{hits}"

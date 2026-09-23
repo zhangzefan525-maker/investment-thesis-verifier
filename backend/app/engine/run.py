@@ -474,6 +474,10 @@ def run_verification(
     )
 
     if not thscode:
+        # 消歧段已经报过一条详细的（含已尝试的候选与写法建议），这里只补一句兜底，
+        # 不重复——否则界面上同一次失败会顶出两条几乎一样的错误。
+        if not any("未能确定标的" in e for e in errors):
+            errors.append("未能确定标的的完整 thscode，取数与验证无法开始")
         return ThesisVerification(
             run_id=run_id,
             parsed=parsed,
@@ -482,7 +486,7 @@ def run_verification(
             conclusion=None,
             data_mode=data_mode,  # type: ignore[arg-type]
             data_mode_note=data_mode_note,
-            errors=errors + ["未能确定标的的完整 thscode，取数与验证无法开始"],
+            errors=errors,
         )
 
     # 3) 取数
