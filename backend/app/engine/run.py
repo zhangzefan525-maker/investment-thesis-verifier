@@ -37,7 +37,7 @@ from .executors import (
     Ctx,
 )
 from .parse import _detect_subject, _subject_candidates, parse_thesis
-from .pipeline import AggregateInput, aggregate, detect_conflicts
+from .pipeline import AggregateInput, aggregate, build_charts, detect_conflicts
 
 EXECUTOR_SETS = {
     ThesisType.DIVERGENCE: DIVERGENCE_EXECUTORS,
@@ -303,7 +303,7 @@ def run_verification(
     errors.extend(x for x in ctx.run_errors if x not in errors)
 
     # 6) 冲突检测
-    conflicts = detect_conflicts(ctx, evidence)
+    conflicts = detect_conflicts(ctx, evidence, parsed.thesis_type)
 
     # 7) 结论聚合
     conclusion = aggregate(
@@ -323,6 +323,7 @@ def run_verification(
         parsed=parsed,
         decomposition=decomposition,
         evidence=evidence,
+        charts=build_charts(ctx),
         conclusion=conclusion,
         data_mode=data_mode,  # type: ignore[arg-type]
         data_mode_note=data_mode_note,

@@ -113,10 +113,45 @@ class FixtureProvider:
     # -- DataProvider 接口 --------------------------------------------------
 
     def search_ticker(self, query: str) -> FetchResult[dict]:
-        r = self._serve(query, "search_ticker", "代码表当前快照", "子串匹配", "-", "标的检索")
-        if r.ok and isinstance(r.value, list):
-            pass
-        return r
+        """在已捕获的快照里检索标的。
+
+        离线模式下没有真正的代码表可查，于是**只认已捕获的那几个标的**，
+        并支持用代码、带后缀代码或中文简称命中。命中范围窄是刻意的：
+        宁愿如实说「离线模式下找不到」，也不假装自己能检索全市场。
+        """
+        q = (query or "").strip().upper()
+        if not q:
+            return _miss(query, self.root)
+        for d in sorted(self.root.iterdir()) if self.root.is_dir() else []:
+            if not d.is_dir():
+                continue
+            blob = self._load(d.name.replace("_", ".", 1), "search_ticker")
+            items = (blob or {}).get("data") or []
+            for item in items:
+                thscode = str(item.get("thscode", ""))
+                ticker = str(item.get("ticker", ""))
+                name = str(item.get("name", ""))
+                if q in {thscode.upper(), ticker.upper(), name.upper()} or (
+                    name and name in q
+                ) or (ticker and ticker in q):
+                    return Ok(
+                        value=[item],
+                        provenance=Provenance(
+                            source=SOURCE_NAME,
+                            endpoint="(fixture: search_ticker)",
+                            request_params={"_query": query, "_matched": thscode},
+                            report_period="代码表当前快照",
+                            caliber="离线子串匹配（仅限已捕获标的）",
+                            unit="-",
+                            request_id=(blob or {}).get("_request_id"),
+                            fetched_at=_parse_ts((blob or {}).get("_captured_at", "")),
+                            raw={
+                                "_fixture": True,
+                                "note": "该命中来自冻结快照的标的表，非实时检索",
+                            },
+                        ),
+                    )
+        return _miss(query, self.root)
 
     def price_snapshot(self, thscodes: list[str]) -> FetchResult[list[dict]]:
         return self._serve(thscodes[0], "price_snapshot", "最新交易日", "不复权", "CNY", "行情快照")
@@ -144,14 +179,17 @@ class FixtureProvider:
         )
 
     def balance_sheets(self, thscode: str, period: str, limit: int) -> FetchResult[list[dict]]:
-        key = "balance_sheets" if period == "quarterly" else "balance_sheets_annual"
+        key = "balance_sheets" if period == "annual" else "balance_sheets_q"
         return self._serve(
             thscode, key, f"最近 {limit} 期（{period}）",
             "整体合并报表（consolidated）", "原币元", "合并资产负债表",
         )
 
     def cash_flow_statements(self, thscode: str, period: str, limit: int) -> FetchResult[list[dict]]:
-        key = "cash_flow_statements" if period == "quarterly" else "cash_flow_statements_annual"
+        # 键名必须与 scripts/capture.py 写入的完全一致，否则离线模式会
+        # 静默缺一路数据（此前 annual 请求去找不存在的
+        # cash_flow_statements_annual，导致离线跑出来的结论与实时不一致）
+        key = "cash_flow_statements" if period == "annual" else "cash_flow_statements_q"
         return self._serve(
             thscode, key, f"最近 {limit} 期（{period}）",
             "整体合并报表（consolidated）", "原币元", "合并现金流量表",
@@ -162,6 +200,25 @@ class FixtureProvider:
             thscode, "financial_indicators", report,
             "单报告期五类指标", "按指标而定（百分比/倍/次）", "财务指标",
         )
+
+
+def _miss(query: str, root: Path) -> Err:
+    have = sorted(d.name.replace("_", ".", 1) for d in root.iterdir()) if root.is_dir() else []
+    return Err(
+        detail=UnverifiableDetail(
+            category=UnverifiableCategory.SOURCE_UNREACHABLE,
+            what_is_needed=f"离线快照中存在与 {query!r} 匹配的标的",
+            where_to_get=(
+                f"当前离线快照仅覆盖 {len(have)} 个标的：{'、'.join(have) or '（空）'}。"
+                f"新增标的需要运行 scripts/capture.py，或配置 HITHINK_FINANCE_API_KEY 切换实时模式"
+            ),
+            failure_evidence=(
+                f"离线检索 query={query!r} 在已捕获标的表中无命中。"
+                f"离线模式不具备全市场检索能力，此处如实报缺失，不做模糊匹配"
+            ),
+        ),
+        endpoint="(fixture: search_ticker)",
+    )
 
 
 def _parse_ts(s: str) -> datetime:

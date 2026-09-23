@@ -123,6 +123,18 @@ class UnverifiableDetail(BaseModel):
         description="失败证据：原始错误码 / 空返回 / 字段缺失的具体描述。禁止静默跳过"
     )
 
+    @field_validator("what_is_needed", "where_to_get", "failure_evidence")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        # 与 Provenance._not_blank 同一条规矩。裸 str 允许空串，
+        # 于是「需要什么 / 何时何地可得 / 失败证据」三问可以填三个空串照样构造成功——
+        # 「有字段」和「答了」是两回事，只有内容非空才算答了。
+        if not v or not v.strip():
+            raise ValueError("无法验证三问不可留空——留空等同于没答，请写明具体内容")
+        if v.strip() in {"-", "—", "N/A", "待定", "无", "暂无"}:
+            raise ValueError(f"三问取值 '{v}' 等同于未答——请写明具体内容，不要用占位符")
+        return v
+
 
 # --------------------------------------------------------------------------
 # M1/M2 命题
@@ -333,6 +345,9 @@ class ThesisVerification(BaseModel):
     parsed: ParsedThesis
     decomposition: DecompositionResult
     evidence: list[Evidence] = Field(default_factory=list)
+    charts: Optional["Charts"] = Field(
+        default=None, description="图表数据。所有点都来自本次运行的证据，不额外取数"
+    )
     conclusion: Optional[Conclusion] = None
     data_mode: Literal["live", "fixture", "mixed"] = Field(
         description="本次数据来源模式。fixture 模式必须在 UI 上明示，不得冒充实时"
@@ -341,6 +356,55 @@ class ThesisVerification(BaseModel):
     errors: list[str] = Field(
         default_factory=list, description="本次运行中发生的失败。失败必须透明，不可静默跳过"
     )
+
+
+class SeriesPoint(BaseModel):
+    """图上的一点。label 是展示用的横轴刻度，值为 None 时该点不从图中跳过而是断线。"""
+
+    label: str
+    value: Optional[float] = None
+
+
+class ValuationChart(BaseModel):
+    """估值分位带图。
+
+    扶摇不提供历史估值，序列由本产品用「前复权收盘价 ÷ EPS_TTM」重建，
+    因此这张图上必须同时给出重建值与官方 pe_ttm 的对照，以及自校准的偏差——
+    否则读者会把它当成行情终端里的官方分位。
+    """
+
+    series: list[SeriesPoint]
+    latest: Optional[float] = None
+    percentile: Optional[float] = None
+    bands: dict[str, float] = Field(default_factory=dict, description="p10/p25/p50/p75/p90 分位线")
+    official_pe_ttm: Optional[float] = None
+    relative_gap: Optional[float] = None
+    caliber: str
+    note: str
+
+
+class ProfitChart(BaseModel):
+    """逐期同比。同一报告期的收入端与利润端并排，用来暴露「增收不增利」。"""
+
+    periods: list[str] = Field(default_factory=list)
+    revenue_yoy: list[Optional[float]] = Field(default_factory=list)
+    profit_yoy: list[Optional[float]] = Field(default_factory=list)
+    unit: str = "%"
+
+
+class MarginChart(BaseModel):
+    """毛利率与营业成本率的同期序列。两者互为镜像，用来看成本压力落在谁身上。"""
+
+    periods: list[str] = Field(default_factory=list)
+    gross_margin: list[Optional[float]] = Field(default_factory=list)
+    cost_ratio: list[Optional[float]] = Field(default_factory=list)
+    unit: str = "%"
+
+
+class Charts(BaseModel):
+    valuation: Optional[ValuationChart] = None
+    profit: Optional[ProfitChart] = None
+    margin: Optional[MarginChart] = None
 
 
 class CompareRequest(BaseModel):

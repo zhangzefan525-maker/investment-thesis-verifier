@@ -18,17 +18,22 @@ from typing import Optional
 
 from ..analysis.fundamentals import health_check
 from ..schemas import (
+    Charts,
     Confidence,
     Conflict,
     ConflictPriority,
     Conclusion,
     Evidence,
     FalsificationCondition,
+    MarginChart,
+    ProfitChart,
+    SeriesPoint,
     ThesisType,
+    ValuationChart,
     Verdict,
 )
 from ..templates.gold import Template
-from .executors import Ctx
+from .executors import Ctx, _prev_same_period
 
 
 # ==========================================================================
@@ -36,13 +41,23 @@ from .executors import Ctx
 # ==========================================================================
 
 
-def detect_conflicts(ctx: Ctx, evidence: list[Evidence]) -> list[Conflict]:
-    """找出方向相反或口径打架的证据。返回空列表代表本次没有发现冲突——那是允许的。"""
+def detect_conflicts(
+    ctx: Ctx, evidence: list[Evidence], ttype: ThesisType
+) -> list[Conflict]:
+    """找出方向相反或口径打架的证据。返回空列表代表本次没有发现冲突——那是允许的。
+
+    **必须传入命题类型。** 子问题 ID（SQ-01、SQ-03……）只在同一套模板内唯一，
+    跨模板完全同名不同义：SQ-03 在背离型是「营业收入」，在归因型是「非经常性损益」。
+    早先这里按 ID 硬编码取证据，于是归因型的冲突正文会写成
+    「估值分位证据显示 PE 处于历史 +54.80%……毛利率离散度 5.97pp」——
+    引用的两条证据都不是它说的东西。类型是这条链路的第一参数，不能靠调用方自觉。
+    """
     conflicts: list[Conflict] = []
     by_id = {e.sub_question_id: e for e in evidence}
 
     # --- 冲突 1：两种复权口径给出的估值分位结论不一致 ---------------------
-    if ctx.series_fwd and ctx.series_none:
+    # 仅背离型：只有该模板把 SQ-01 定义为估值分位。
+    if ttype is ThesisType.DIVERGENCE and ctx.series_fwd and ctx.series_none:
         p_fwd = ctx.series_fwd.percentile("pe_reconstructed")
         p_non = ctx.series_none.percentile("pe_reconstructed")
         if p_fwd is not None and p_non is not None:
@@ -76,7 +91,7 @@ def detect_conflicts(ctx: Ctx, evidence: list[Evidence]) -> list[Conflict]:
                 )
 
     # --- 冲突 2：重建值与官方快照偏差超容差 -------------------------------
-    if ctx.series_fwd and ctx.series_fwd.calibration:
+    if ttype is ThesisType.DIVERGENCE and ctx.series_fwd and ctx.series_fwd.calibration:
         gap = ctx.series_fwd.calibration.get("relative_gap")
         e1 = by_id.get("SQ-01")
         if gap is not None and gap > 0.35 and e1:
@@ -105,8 +120,9 @@ def detect_conflicts(ctx: Ctx, evidence: list[Evidence]) -> list[Conflict]:
             )
 
     # --- 冲突 3：估值分位的「低估」读法与周期性提示打架 -------------------
+    # 仅背离型：SQ-01 是估值分位、SQ-06 是毛利率离散度，只有这套模板同时具备这两条。
     e_val, e_cyc = by_id.get("SQ-01"), by_id.get("SQ-06")
-    if e_val and e_cyc and e_val.verdict is Verdict.SUPPORT:
+    if ttype is ThesisType.DIVERGENCE and e_val and e_cyc and e_val.verdict is Verdict.SUPPORT:
         sd = e_cyc.value
         if isinstance(sd, (int, float)) and sd > 5.0:
             conflicts.append(
@@ -139,7 +155,11 @@ def detect_conflicts(ctx: Ctx, evidence: list[Evidence]) -> list[Conflict]:
     # 这不是「数据打架」——两个数字都真实且同口径。冲突在于**它们对同一个问题
     # 「基本面有没有恶化」给出了相反回答**。把这种分歧摊开，比强行给一个结论诚实。
     d3, d4 = by_id.get("SQ-03"), by_id.get("SQ-04")
-    if d3 and d4 and d3.verdict is Verdict.SUPPORT and d4.verdict is Verdict.REFUTE:
+    if (
+        ttype is ThesisType.DIVERGENCE
+        and d3 and d4
+        and d3.verdict is Verdict.SUPPORT and d4.verdict is Verdict.REFUTE
+    ):
         conflicts.append(
             Conflict(
                 sub_question_id="SQ-04",
@@ -171,7 +191,11 @@ def detect_conflicts(ctx: Ctx, evidence: list[Evidence]) -> list[Conflict]:
 
     # --- 冲突 5（归因型）：收入支持与利润来源反对并存 ---------------------
     a1, a3 = by_id.get("SQ-01"), by_id.get("SQ-03")
-    if a1 and a3 and a1.verdict is Verdict.SUPPORT and a3.verdict is Verdict.REFUTE:
+    if (
+        ttype is ThesisType.ATTRIBUTION
+        and a1 and a3
+        and a1.verdict is Verdict.SUPPORT and a3.verdict is Verdict.REFUTE
+    ):
         conflicts.append(
             Conflict(
                 sub_question_id="SQ-03",
@@ -414,132 +438,290 @@ def _next_disclosure(today: Optional[date] = None) -> str:
     return "年内已无定期报告节点"
 
 
+def build_charts(ctx: Ctx) -> Optional[Charts]:
+    """把本次已经取到的数据整理成三张图。
+
+    **不发起任何新的取数**——图上每一个点都能在证据卡里找到出处。
+    图只是同一批证据的另一种呈现方式，不是新的论据来源。
+    """
+    val = None
+    s = ctx.series_fwd
+    if s is not None:
+        pts = s.metrics.get("pe_reconstructed") or []
+        if pts:
+            # 序列可能上千个交易日，逐点下发既大又没必要。按固定间隔抽稀，
+            # 但**首尾两点必留**——横轴的两端被截掉会让趋势看着变形。
+            step = max(1, len(pts) // 220)
+            kept = pts[::step]
+            if kept[-1] is not pts[-1]:
+                kept = kept + [pts[-1]]
+
+            def _bin(name: str) -> Optional[float]:
+                idx = s.percentile(name)
+                return idx
+
+            vals = [p.value for p in kept if p.value is not None]
+            bands: dict[str, float] = {}
+            allv = sorted(p.value for p in pts if p.value is not None)
+            if len(allv) >= 20:
+                for q, key in ((0.10, "p10"), (0.25, "p25"), (0.50, "p50"),
+                               (0.75, "p75"), (0.90, "p90")):
+                    bands[key] = round(allv[min(len(allv) - 1, int(len(allv) * q))], 2)
+
+            calib = s.calibration or {}
+            val = ValuationChart(
+                series=[
+                    SeriesPoint(label=_day(p.date_ms), value=round(p.value, 3))
+                    for p in kept
+                    if p.value is not None
+                ],
+                latest=round(vals[-1], 3) if vals else None,
+                percentile=s.percentile("pe_reconstructed"),
+                bands=bands,
+                official_pe_ttm=calib.get("official_pe_ttm"),
+                relative_gap=calib.get("relative_gap"),
+                caliber="前复权收盘价 ÷ EPS_TTM（本产品重建）",
+                note=(
+                    "扶摇公开接口不提供历史估值序列，本图由本产品重建。"
+                    "重建值与官方 pe_ttm 的偏差见图中标注；偏差在容差内时趋势可用，"
+                    "绝对水平只作参考。"
+                ),
+            )
+
+    periods: list[str] = []
+    rev: list[Optional[float]] = []
+    prof: list[Optional[float]] = []
+    rows = sorted(
+        [r for r in (ctx.income_q or []) if r.get("period_end_ms")],
+        key=lambda r: r["period_end_ms"],
+    )
+    for r in rows:
+        prev = _prev_same_period(ctx.income_q, r)
+        if prev is None:
+            continue
+        pv = prev.get("operating_income")
+        pf = prev.get("parent_holder_net_profit")
+        cv = r.get("operating_income")
+        cf = r.get("parent_holder_net_profit")
+        if not pv or pv == 0:
+            continue
+        periods.append(f"{r.get('fiscal_year')}{r.get('fiscal_period')}")
+        rev.append(round(100.0 * (cv - pv) / abs(pv), 2) if cv is not None else None)
+        prof.append(round(100.0 * (cf - pf) / abs(pf), 2) if cf is not None and pf else None)
+    profit = (
+        ProfitChart(periods=periods, revenue_yoy=rev, profit_yoy=prof)
+        if len(periods) >= 2
+        else None
+    )
+
+    gm = getattr(ctx, "gm_series", None) or []
+    cr = getattr(ctx, "cost_ratio_series", None) or []
+    margin = None
+    if len(gm) >= 2 and len(gm) == len(cr):
+        # 横轴刻度必须用真实报告期，不能写 T-1/T-2 这种占位——
+        # 没有报告期的数字读者无法与财报核对，图上就成了一条无出处的曲线。
+        all_labels = [f"{r.get('fiscal_year')}{r.get('fiscal_period')}" for r in rows]
+        if len(all_labels) >= len(gm):
+            labels = all_labels[-len(gm):]
+        elif any(not str(x).startswith("T-") for x in all_labels):
+            labels = [f"第 {i + 1} 期" for i in range(len(gm))]
+        else:
+            labels = all_labels
+        margin = MarginChart(
+            periods=labels,
+            gross_margin=[round(x, 2) for x in gm],
+            cost_ratio=[round(x, 2) for x in cr],
+        )
+
+    if val is None and profit is None and margin is None:
+        return None
+    return Charts(valuation=val, profit=profit, margin=margin)
+
+
+def _day(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
+
+
 def falsification_conditions(
     ctx: Ctx, evidence: list[Evidence], ttype: ThesisType
 ) -> list[FalsificationCondition]:
     """产出可监控的反转条件。每条都必须有阈值依据，禁止拍脑袋。
 
-    **当前值一律从证据对象里读，不另走一条计算路径。**
-    早先这里是拿年报重算一遍的，结果证据卡用的是最新季报（2026Q2）、
-    反转条件表用的是去年年报（2025FY），同一个指标在同一个页面出现两个数字。
-    从证据读值让「一致性」成为结构保证，而不是靠两处代码记得同步改。
+    **当前值一律取自证据卡的 display_value，不另起一条格式化路径。**
+    两处早先各自算、各自格式化同一个数字，临界值上会差最后一位
+    （证据卡 1.85 倍、反转条件表 1.84 倍），读者无从判断哪个对。
+    更严重的是本表早先按子问题 ID 硬编码，而 ID 只在同一套模板内唯一：
+    归因型下 SQ-03 是「非经常性损益」、SQ-04 是「期间费用率」，
+    于是「营业收入同比增速」一栏被填进了 ROE 差额、真正的营收增速在表里根本不出现，
+    标题与数字对不上。现在按命题类型分别取 ID，数字直接引用证据卡的展示串——
+    一致性成为结构保证，而不是靠两处代码记得同步改。
     """
     conds: list[FalsificationCondition] = []
     by_id = {e.sub_question_id: e for e in evidence}
     nxt = _next_disclosure()
 
-    def pick(*sq_ids: str) -> tuple[Optional[float], str, str]:
-        """按顺序找到第一个给出数值的证据。返回 (值, 报告期描述, 来源证据 id)。"""
-        for sid in sq_ids:
-            e = by_id.get(sid)
-            if e is None or e.value is None:
-                continue
-            try:
-                v = float(e.value)
-            except (TypeError, ValueError):
-                continue
-            return v, e.provenance.report_period, sid
-        return None, "", ""
-
-    if ttype in (ThesisType.DIVERGENCE, ThesisType.ATTRIBUTION):
-        rev, rev_p, _ = pick("SQ-03", "SQ-01")
-        if rev is not None:
-            conds.append(
-                FalsificationCondition(
-                    monitored_variable="营业收入同比增速",
-                    current_value=f"{rev:+.2f}%（{rev_p}）",
-                    trigger_threshold="由正转负（< 0%）",
-                    direction="下行突破",
-                    flips_sub_question="SQ-03 收入端未恶化 → 恶化了",
-                    marginal_impact="high",
-                    next_disclosure=nxt,
-                    threshold_basis=(
-                        "0% 是「增长 / 萎缩」的会计分界，不是经验取值。"
-                        "收入同比转负意味着主营规模开始收缩，命题「基本面未恶化」的前提直接消失。"
-                    ),
-                )
-            )
-        prof, prof_p, _ = pick("SQ-04")
-        if prof is not None:
-            conds.append(
-                FalsificationCondition(
-                    monitored_variable="归母净利润同比增速",
-                    current_value=f"{prof:+.2f}%（{prof_p}）",
-                    trigger_threshold="由正转负（< 0%）",
-                    direction="下行突破",
-                    flips_sub_question="SQ-04 利润端未恶化 → 恶化了",
-                    marginal_impact="high",
-                    next_disclosure=nxt,
-                    threshold_basis="同上，0% 是盈亏增长的分界。",
-                )
-            )
-        # 现金含量：三态判据是「≥0.8 支持 / 0.5–0.8 中性 / <0.5 反对」，
-        # 因此触发阈值取 0.8（跌出支持区间）而非 0.5——当前已在 0.75 时，
-        # 用 0.5 会显示成「还没触发」，但结论其实早已不在支持下。
-        cash, cash_p, _ = pick("SQ-05")
-        if cash is not None:
-            already_weak = cash < 0.8
-            conds.append(
-                FalsificationCondition(
-                    monitored_variable="净利润现金含量（经营现金流净额 ÷ 归母净利润）",
-                    current_value=f"{cash:.2f} 倍（{cash_p}）",
-                    trigger_threshold=(
-                        "回到 0.8 倍以上（当前已跌破，正处中性区间）"
-                        if already_weak else "跌破 0.8 倍（退出支持区间）"
-                    ),
-                    direction="下行突破" if not already_weak else "上行修复",
-                    flips_sub_question="SQ-05 盈利质量未恶化 → 恶化了",
-                    marginal_impact="medium",
-                    next_disclosure=nxt,
-                    threshold_basis=(
-                        "0.8 倍取自本产品 SQ-05 判据的支持区间下沿，不是经验值："
-                        "该条只有 ≥0.8 才算「盈利质量未恶化」，0.5–0.8 之间不构成方向性证据，"
-                        "低于 0.5 则转为明确反对。因此真正能翻转结论的阈值是 0.8，不是 0.5。"
-                    ),
-                )
-            )
-
-    if ttype is ThesisType.ATTRIBUTION:
-        nr, nr_p, _ = pick("SQ-03")
+    def add(
+        sid: str,
+        *,
+        variable: str,
+        threshold: str,
+        direction: str,
+        flips: str,
+        impact: str,
+        basis: str,
+    ) -> None:
+        """从证据卡取当前值。证据卡缺失或无数值时**不生成该行**——宁可少一行，不可编一个数。"""
+        e = by_id.get(sid)
+        if e is None or e.value is None:
+            return
         conds.append(
             FalsificationCondition(
-                monitored_variable="非经常性损益影响（加权ROE − 扣非加权ROE）",
-                current_value=f"{nr:+.2f}pp（{nr_p}）" if nr is not None else "本期不可得",
-                trigger_threshold="超过 2pp",
-                direction="上行突破",
-                flips_sub_question="SQ-03 利润来源 → 从主营转为非主营",
-                marginal_impact="high",
+                monitored_variable=variable,
+                current_value=f"{e.display_value}（{e.provenance.report_period}）",
+                trigger_threshold=threshold,
+                direction=direction,
+                flips_sub_question=flips,
+                marginal_impact=impact,
                 next_disclosure=nxt,
-                threshold_basis=(
-                    "2pp 取自本产品 SQ-03 的判定阈值，含义是「非经常性损益对 ROE 的贡献超过 2 个百分点」，"
-                    "此时它在利润中的权重已不容忽视。该阈值在模板中事先写定，不随个案调整。"
-                ),
+                threshold_basis=basis,
             )
+        )
+
+    # 现金含量：三态判据是「≥0.8 支持 / 0.5–0.8 中性 / <0.5 反对」，
+    # 因此触发阈值取 0.8（跌出支持区间）而非 0.5——当前已在 0.75 时，
+    # 用 0.5 会显示成「还没触发」，但结论其实早已不在支持下。
+    def cash_row(sid: str, flips: str) -> None:
+        e = by_id.get(sid)
+        if e is None or e.value is None:
+            return
+        try:
+            weak = float(e.value) < 0.8
+        except (TypeError, ValueError):
+            return
+        add(
+            sid,
+            variable="净利润现金含量（经营现金流净额 ÷ 归母净利润）",
+            threshold=(
+                "回到 0.8 倍以上（当前已跌破，正处中性区间）"
+                if weak else "跌破 0.8 倍（退出支持区间）"
+            ),
+            direction="上行修复" if weak else "下行突破",
+            flips=flips,
+            impact="medium",
+            basis=(
+                "0.8 倍取自本产品 SQ-05 判据的支持区间下沿，不是经验值："
+                "该条只有 ≥0.8 才算「盈利质量未恶化」，0.5–0.8 之间不构成方向性证据，"
+                "低于 0.5 则转为明确反对。因此真正能翻转结论的阈值是 0.8，不是 0.5。"
+            ),
         )
 
     if ttype is ThesisType.DIVERGENCE:
-        sd = by_id.get("SQ-06")
-        conds.append(
-            FalsificationCondition(
-                monitored_variable="毛利率多期离散度（周期性代理指标）",
-                current_value=(
-                    f"{sd.display_value}（{sd.provenance.report_period}）"
-                    if sd and sd.value is not None else "样本不足"
-                ),
-                trigger_threshold="标准差超过 5pp",
-                direction="上行突破",
-                flips_sub_question="SQ-06 周期性判定 → 从「可常规解读」转为「须附加周期限定」",
-                marginal_impact="medium",
-                next_disclosure=nxt,
-                threshold_basis=(
-                    "5pp 为本产品在模板中预设的周期性判定阈值。它一旦被触发，"
-                    "SQ-01 的 PE 分位就不能再被读作「便宜」，结论从「估值回落」"
-                    "退化为「估值处于历史低位，但周期位置未知」。"
-                ),
-            )
+        add(
+            "SQ-03",
+            variable="营业收入同比增速",
+            threshold="由正转负（< 0%）",
+            direction="下行突破",
+            flips="SQ-03 收入端未恶化 → 恶化了",
+            impact="high",
+            basis=(
+                "0% 是「增长 / 萎缩」的会计分界，不是经验取值。"
+                "收入同比转负意味着主营规模开始收缩，命题「基本面未恶化」的前提直接消失。"
+            ),
+        )
+        add(
+            "SQ-04",
+            variable="归母净利润同比增速",
+            threshold="由正转负（< 0%）",
+            direction="下行突破",
+            flips="SQ-04 利润端未恶化 → 恶化了",
+            impact="high",
+            basis="同上，0% 是盈亏增长的分界。",
+        )
+        cash_row("SQ-05", "SQ-05 盈利质量未恶化 → 恶化了")
+        add(
+            "SQ-06",
+            variable="毛利率多期离散度（周期性代理指标）",
+            threshold="标准差超过 5pp",
+            direction="上行突破",
+            flips="SQ-06 周期性判定 → 从「可常规解读」转为「须附加周期限定」",
+            impact="medium",
+            basis=(
+                "5pp 为本产品在模板中预设的周期性判定阈值。它一旦被触发，"
+                "SQ-01 的 PE 分位就不能再被读作「便宜」，结论从「估值回落」"
+                "退化为「估值处于历史低位，但周期位置未知」。"
+            ),
         )
 
-    if ttype is ThesisType.TRANSMISSION:
+    elif ttype is ThesisType.ATTRIBUTION:
+        # 归因型的主判据是「利润来源」，不是「收入增速」——
+        # 收入增长只排除了「收入没增长」这一个反例，说明不了利润从哪来。
+        # 因此本表把非经常性损益放在第一行，其余各条按对结论的实际影响力排序。
+        add(
+            "SQ-03",
+            variable="非经常性损益影响（加权ROE − 扣非加权ROE）",
+            threshold="超过 2pp",
+            direction="上行突破",
+            flips="SQ-03 利润来源 → 从主营转为非主营（核心判据翻转，总结论随之翻转）",
+            impact="high",
+            basis=(
+                "2pp 取自本产品 SQ-03 的判定阈值，含义是「非经常性损益对 ROE 的贡献超过 2 个百分点」，"
+                "此时它在利润中的权重已不容忽视。该阈值在模板中事先写定，不随个案调整。"
+            ),
+        )
+        add(
+            "SQ-01",
+            variable="营业收入同比增速",
+            threshold="由正转负（< 0%）",
+            direction="下行突破",
+            flips="SQ-01 主业规模在扩张 → 不再扩张",
+            impact="high",
+            basis=(
+                "0% 是「增长 / 萎缩」的会计分界。归因型命题的完整表述是「盈利改善**来自主营业务**」，"
+                "收入转负意味着产生利润的主业本身在收缩，「来自主营业务」的规模基础不复存在。"
+            ),
+        )
+        add(
+            "SQ-02",
+            variable="毛利率同比变动",
+            threshold="跌破 −1pp（跌出中性区间，由「不构成证据」转为「反对」）",
+            direction="下行突破",
+            flips="SQ-02 主业盈利能力 → 由改善或中性转为恶化",
+            impact="medium",
+            basis=(
+                "−1pp 取自本产品 SQ-02 判据的反对区间边界。取 −1pp 而非 0，是因为 ±1pp 内"
+                "属于产品结构与季度节奏造成的正常波动，本产品的判据在该区间内不做方向性判断；"
+                "越过 −1pp 才构成「主业盈利能力恶化」的证据。"
+            ),
+        )
+        add(
+            "SQ-04",
+            variable="期间费用率同比变动",
+            threshold="降幅超过 1pp（由中性转为「省出来的」）",
+            direction="下行突破",
+            flips="SQ-04 中性 → 反对（利润改善被归因于费用压缩而非主业变强）",
+            impact="medium",
+            basis=(
+                "1pp 取自本产品 SQ-04 判据的分界。费用率降幅超过 1pp 且收入未同步增长时，"
+                "本条判为「省出来的」并转为反对——降本增效与主业变强是两回事，"
+                "这个阈值就是用来把两者分开的。"
+            ),
+        )
+        cash_row("SQ-05", "SQ-05 利润的现金支撑 → 恶化了")
+
+    elif ttype is ThesisType.TRANSMISSION:
+        add(
+            "SQ-02",
+            variable="营业成本率累计变动（上游成本压力的报表可见部分）",
+            threshold="绝对变动回到 3pp 以内（成本端压力消失）",
+            direction="收敛至中性",
+            flips="SQ-02 成本端确有变化 → 无变化（命题的传导前提不成立）",
+            impact="high",
+            basis=(
+                "3pp 取自本产品 SQ-02 判据的阈值。它一旦收敛回 3pp 以内，"
+                "「外部成本变化」这个命题前提本身就不成立了——"
+                "没有成本变化，就谈不上成本在产业链上如何分配。"
+            ),
+        )
         conds.append(
             FalsificationCondition(
                 monitored_variable="主营业务构成（分部收入占比）",
