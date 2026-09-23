@@ -1,0 +1,21 @@
+{
+  "_captured_at": "2026-09-23T09:37:58.853972+00:00",
+  "_endpoint": "GET /api/a-share/valuations/snapshot",
+  "_params": {
+    "thscodes": "002594.SZ"
+  },
+  "_request_id": "bec667344ce542a58381420904667046",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": [
+    {
+      "thscode": "002594.SZ",
+      "ticker": "002594",
+      "name": "比亚迪",
+      "pe_ttm": 26.592177,
+      "pe_mrq": 31.751947,
+      "pb_mrq": 3.261684,
+      "ps_ttm": 0.978142,
+      "pcf_ttm": 12.109374
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "_captured_at": "2026-09-23T09:37:54.294038+00:00",
+  "_endpoint": "GET /api/a-share/prices/snapshot",
+  "_params": {
+    "thscodes": "002594.SZ"
+  },
+  "_request_id": "df14e45cddd94ffd8f0eb00f0f448e9b",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": [
+    {
+      "thscode": "002594.SZ",
+      "ticker": "002594",
+      "volume": 17315474,
+      "turnover": 1488954600,
+      "last_price": 85.85,
+      "price_change": -0.73,
+      "price_change_ratio_pct": -0.843151,
+      "open_price": 86,
+      "high_price": 86.55,
+      "low_price": 85.66,
+      "prev_price": 86.58
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "_captured_at": "2026-09-23T09:37:42.290069+00:00",
+  "_endpoint": "GET /api/a-share/valuations/snapshot",
+  "_params": {
+    "thscodes": "300750.SZ"
+  },
+  "_request_id": "d60f60deb33a45dea5e35d21f7c28337",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": [
+    {
+      "thscode": "300750.SZ",
+      "ticker": "300750",
+      "name": "宁德时代",
+      "pe_ttm": 16.385847,
+      "pe_mrq": 16.089078,
+      "pb_mrq": 3.671506,
+      "ps_ttm": 3.80903,
+      "pcf_ttm": 10.336192
+    }
+  ]
+}

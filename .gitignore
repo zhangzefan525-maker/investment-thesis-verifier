@@ -14,7 +14,6 @@ venv/
 
 # Node
 node_modules/
-frontend/dist/
 .vite/
 
 # 编辑器与系统
@@ -27,5 +26,8 @@ Thumbs.db
 *.zip
 *.7z
 build/
-dist/
-!frontend/dist/
+/dist/
+
+# frontend/dist 必须进仓库：评审者不装 node_modules 也应能直接跑起前端。
+# 注意不能写 `frontend/dist/`——目录一旦被排除，后面的 ! 取反对它无效。
+# 这里用根锚定的 `/dist/`，只排除仓库根目录下的构建产物。

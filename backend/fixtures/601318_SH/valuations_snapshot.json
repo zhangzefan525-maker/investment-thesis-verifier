@@ -1,0 +1,21 @@
+{
+  "_captured_at": "2026-09-23T09:38:10.800676+00:00",
+  "_endpoint": "GET /api/a-share/valuations/snapshot",
+  "_params": {
+    "thscodes": "601318.SH"
+  },
+  "_request_id": "46f73560882c48ad8ecd866b8a9cb2a0",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": [
+    {
+      "thscode": "601318.SH",
+      "ticker": "601318",
+      "name": "中国平安",
+      "pe_ttm": 6.122792,
+      "pe_mrq": 5.267909,
+      "pb_mrq": 0.948812,
+      "ps_ttm": 0.862656,
+      "pcf_ttm": 1.416821
+    }
+  ]
+}

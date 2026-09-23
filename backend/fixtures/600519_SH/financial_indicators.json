@@ -1,0 +1,36 @@
+{
+  "_captured_at": "2026-09-23T09:37:34.925345+00:00",
+  "_endpoint": "GET /api/a-share/financials/indicators",
+  "_params": {
+    "thscode": "600519.SH",
+    "report": "2026-2"
+  },
+  "_request_id": "97b44914c5f74faa8f7d6b160ca76bac",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": {
+    "calculate_operating_income_yoy_growth_ratio": "1.46986900",
+    "calculate_operating_profit_yoy_growth_ratio": "-2.16298200",
+    "total_assets_growth_ratio": "1.7167",
+    "fixed_asset_invest_expansion_ratio": "2.12587300",
+    "calculate_parent_holder_net_profit_yoy_growth_ratio": "-1.95159500",
+    "total_assets_net_ratio": "15.0218",
+    "index_deduct_weighted_avg_roe": "16.7400",
+    "sale_gross_margin": "89.5552",
+    "sale_net_interest_ratio": "50.7516",
+    "index_weighted_avg_roe": "16.7500",
+    "current_ratio": "5.5895",
+    "cash_ratio": "114.73623000",
+    "quick_ratio": "4.2348",
+    "earned_interest_multiple": null,
+    "assets_debt_ratio": "15.1931",
+    "total_assets_turnover_ratio": "0.2960",
+    "inventory_turnover_ratio": "0.1544",
+    "long_term_debt_equity_ratio": "0.12312600",
+    "current_assets_turnover_ratio": "0.3596",
+    "receive_account_turnover_ratio": "57047.0891",
+    "net_profit_cash_content": "158.79538200",
+    "cash_operating_index": "1.49537478",
+    "operating_cash_flow_net_divide_income": "77.9363",
+    "cash_meet_invest_ratio": "1.97763799"
+  }
+}

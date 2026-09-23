@@ -1,0 +1,24 @@
+{
+  "_captured_at": "2026-09-23T09:38:05.804817+00:00",
+  "_endpoint": "GET /api/meta/tickers/search",
+  "_params": {
+    "q": "601318.SH",
+    "limit": 10
+  },
+  "_request_id": "0e5167f42c694d44a0196f57baa71687",
+  "_note": "本文件由真实调用扶摇接口捕获，非模拟数据",
+  "data": [
+    {
+      "thscode": "601318.SH",
+      "ticker": "601318",
+      "name": "中国平安",
+      "exchange": "SH",
+      "asset_type": "a-share",
+      "currency": "CNY",
+      "list_date": "2007-03-01",
+      "end_date": null,
+      "last_trade_date": null,
+      "last_delivery_date": null
+    }
+  ]
+}
