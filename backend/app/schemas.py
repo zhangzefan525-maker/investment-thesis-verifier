@@ -161,6 +161,17 @@ class ClarificationQuestion(BaseModel):
         description="该回答对本轮验证产生的**实际**影响。回答了就必须说明它改了什么；"
         "若它不改变任何取数与判定，也要如实写「不改变下游」——不允许用模糊措辞把无效果说成有效果",
     )
+    effect_kind: Optional[str] = Field(
+        default=None,
+        description=(
+            "回答落地后**实际执行**的动作类型：`unverifiable`（改判）/ `drop`（移出范围）/"
+            "`limitation`（只追加一条适用边界）/ `none`（下游不变）。取值与 "
+            "`parse.ANSWER_EFFECTS` 里那一栏完全同源，由判定层写入，不另起一套。"
+            "它存在是因为前端此前只有 `impact` 这段自然语言可依据，于是对所有回答一律写"
+            "「本轮按你的回答计算」——而 13 个只追加边界声明的回答其实**没有改变任何计算**，"
+            "同一张卡片下面那行还写着「追加适用边界」。分开之后，标签才能与动作对上。"
+        ),
+    )
 
 
 class ThesisVersion(BaseModel):
@@ -190,6 +201,26 @@ class ParsedThesis(BaseModel):
     clarifications: list[ClarificationQuestion] = Field(default_factory=list)
     v2: ThesisVersion
     diffs: list[ThesisDiff] = Field(default_factory=list)
+    parsed_by: Literal["llm", "rule_engine"] = Field(
+        default="rule_engine",
+        description=(
+            "本句命题的**类型判定与标的/时间窗抽取**由谁完成。"
+            "它的存在是为了让 `decomposition.generated_by` 说实话："
+            "该字段此前被写死为 `hybrid`（手工模板 + AI 实例化），"
+            "但在没有凭据、或 LLM 调用失败退回规则引擎时，AI 一个字都没有参与，"
+            "界面上却仍然标着「hybrid」——把「AI 参与了」写在一个 AI 没参与的运行上。"
+        ),
+    )
+    unmatched_answers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "用户在澄清环节提交、但**对不上本轮任何一条澄清问题**的原话。"
+            "它必须能被看见：回答以题面为键，而题面由命题类型生成；用户在文本框里改了命题"
+            "（或 AI 把类型判成了另一类），题面就会整组换掉，上一轮的回答便一条也对不上。"
+            "此前的行为是静默丢弃——`answers.get(q)` 取不到就当没回答，errors 里没有痕迹，"
+            "按钮旁却写着「有 N 条待生效」。「用户答了但产品没听见」比「不让答」更糟。"
+        ),
+    )
 
     @model_validator(mode="after")
     def _thscode_required(self) -> "ParsedThesis":
@@ -292,13 +323,40 @@ class Conflict(BaseModel):
     """证据冲突。强制渲染，不做和稀泥。"""
 
     sub_question_id: str
-    evidence_ids: list[str] = Field(min_length=2)
+    evidence_ids: list[str] = Field(default_factory=list, description=(
+        "本冲突涉及**证据卡的 id**。只放真实存在的卡：前端把它逐字渲染成「涉及证据 …」，"
+        "读者会拿着这些编号去证据卡列表里核对。早先这里写过两个假 id —— "
+        "`SNAPSHOT-PE-TTM`（一个数值，不是卡）与兜底用的 `EV-SQ-01` —— "
+        "前者让读者去找一张不存在的卡，后者在长度校验下直接抛异常。"
+        "不是卡的那一端请写进 counterparty。"))
+    counterparty: Optional[str] = Field(default=None, description=(
+        "冲突的**另一端若不是子问题、因而没有证据卡**，在这里如实写出它是什么（含来源与口径），"
+        "前端会把它作为「对照」单独渲染。把它硬塞进 evidence_ids 里假装成一张卡，"
+        "是同一类「说了它没有的东西」。"))
     nature: str = Field(description="冲突的性质：是口径不同、时点不同，还是真的结论相反")
     resolving_priority: ConflictPriority = Field(description="依据哪个优先维度裁决")
     resolution: str = Field(description="裁决过程与结论")
     residual_uncertainty: str = Field(
         description="裁决后残余的不确定性。不许写「无」——除非确实已完全消解，并说明为何"
     )
+
+    @model_validator(mode="after")
+    def _at_least_two_sides(self) -> "Conflict":
+        """一条冲突至少要有**两端**。
+
+        这条不变式原本写作 `evidence_ids: list[str] = Field(min_length=2)`，
+        本意是「冲突是两条证据之间的事」。但真实冲突的另一端有时不是证据卡
+        （例如扶摇官方快照里的 pe_ttm 只是一个随快照返回的数值），
+        于是代码为了凑够长度，两次凭空编了一个 id 出来 —— 校验通过，界面说谎。
+        不变式本身是对的，错的是「一端必须是卡」这个隐含前提：
+        现在两端 = 证据卡 + counterparty，凑够两个即可，不许再编 id。
+        """
+        if len(self.evidence_ids) + (1 if self.counterparty else 0) < 2:
+            raise ValueError(
+                "冲突至少要有两端：证据卡 id 与 counterparty 合计不足两个。"
+                "缺少的那一端必须写清楚它是什么，不能编一个 id 顶上。"
+            )
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -320,6 +378,17 @@ class FalsificationCondition(BaseModel):
     next_disclosure: str = Field(description="下次披露时点")
     threshold_basis: str = Field(
         description="阈值依据——为什么是这个数。禁止拍脑袋，必须说明来自历史区间/会计恒等式/同业水准"
+    )
+    already_triggered: bool = Field(
+        default=False,
+        description=(
+            "**当前值是否已经满足 trigger_threshold**。"
+            "这张表叫「反转条件表」，观众默认它是「未来可能发生的事」；"
+            "但实测里存在当前值**已经越过阈值**的行（如利润同比已经是负数、"
+            "成本率变动已经回到 3pp 以内）。把已经发生的事标成待发生的风险，"
+            "读者会据此判断结论还很稳——方向正好反了。"
+            "为真时 direction 会带上「已触发」前缀，前端另有一个醒目标记。"
+        ),
     )
 
 
@@ -369,6 +438,15 @@ class ThesisVerification(BaseModel):
     errors: list[str] = Field(
         default_factory=list, description="本次运行中发生的失败。失败必须透明，不可静默跳过"
     )
+    answer_journal: list[str] = Field(
+        default_factory=list,
+        description=(
+            "澄清回答的**执行回执**：本轮按用户的回答实际做了什么，逐条列出。"
+            "它此前被并进 `errors`，前端据此渲染成「失败透明清单 —— 本次有 N 条失败或提示」——"
+            "用户答一句「不确定」就让页面上的失败条数 +1，内容却是「追加适用边界」。"
+            "回答生效不是失败，两者必须分开放。"
+        ),
+    )
 
 
 class SeriesPoint(BaseModel):
@@ -414,10 +492,27 @@ class MarginChart(BaseModel):
     unit: str = "%"
 
 
+class WithheldChart(BaseModel):
+    """一张**本来会画、但本轮主动撤下**的图，以及撤下的原因。"""
+
+    name: str = Field(description="图的名称，与前端区块一致")
+    backs_sub_question: str = Field(description="这张图所呈现的是哪条子问题的数据")
+    reason: str = Field(description="撤下的原因；必须说明是「证据被判无效」而不是「没取到数」")
+
+
 class Charts(BaseModel):
     valuation: Optional[ValuationChart] = None
     profit: Optional[ProfitChart] = None
     margin: Optional[MarginChart] = None
+    withheld: list[WithheldChart] = Field(default_factory=list, description=(
+        "**本轮主动没有画出来的图，以及为什么**。"
+        "chart 与 evidence 是两套代码路径：图直接读取数结果（`build_charts(ctx)`），"
+        "不读证据判定，因此当某条子问题被澄清环节整体作废时（例如用户把估值参照系"
+        "改成「与同业比」，SQ-01 判为口径不可得），图会照旧把那条作废证据的数值画出来、"
+        "并在页脚印上「当前 PE x，处于自身历史 y 分位」——与结论区「估值侧落入无法验证、"
+        "不给方向性判断」正相反，也与本产品承诺的「不换成与自身历史比硬算一个数」正相反。"
+        "作废的与被顶替的都必须是显式的：这里列出被撤下的图与原因，既不是静默省略，"
+        "也不是继续展示。"))
 
 
 class CompareRequest(BaseModel):

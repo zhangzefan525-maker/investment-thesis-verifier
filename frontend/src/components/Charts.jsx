@@ -1,8 +1,14 @@
 import { useMemo, useState } from 'react'
+import RichText from './RichText.jsx'
 
 export default function Charts({ run }) {
   const c = run.charts
   if (!c) return null
+  // 依据被撤的证据而撤下的图。用它判断这一节是不是"图没了但有话要说"——
+  // 那种情况下面板仍要渲染，否则用户只会看到图表区凭空消失。
+  const withheld = c.withheld || []
+  const hasAny = !!(c.valuation || c.profit || c.margin)
+  if (!hasAny && !withheld.length) return null
   return (
     <section id="charts" className="scroll-mt-16">
       <h2 className="mb-2.5 text-[14px] font-semibold text-ink-900">
@@ -11,7 +17,32 @@ export default function Charts({ run }) {
       <p className="mb-3 text-[11px] leading-relaxed text-ink-500">
         图上的每一个点都来自上面某张证据卡，没有额外取数、没有插值、没有平滑。
         纵轴不截断、不做对数变换——截断纵轴是最常见的视觉误导手法。
+        一张图如果所依据的那条子问题在本轮被撤了（例如用户在澄清环节换掉了估值参照系），
+        这张图会一并撤下并写明原因，而不是继续画出来。
       </p>
+
+      {/* 撤下的图必须**显式列出来**。图是另一条代码路径（只读取数结果），
+          它不会自己知道某条证据已经被澄清环节作废；不列出来，
+          用户看到的是「我选了一下，图就没了」，而没有任何解释。 */}
+      {withheld.length > 0 && (
+        <ul className="mb-3 space-y-2">
+          {withheld.map((w, i) => (
+            <li key={i} className="rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2">
+              <div className="text-[12px] font-medium text-amber-900">
+                已撤下：{w.name}
+                <span className="ml-1.5 font-mono text-[10px] font-normal text-amber-800">
+                  依据 {w.backs_sub_question}
+                </span>
+              </div>
+              <RichText
+                className="mt-1 block text-[11px] leading-relaxed text-amber-800"
+                text={w.reason}
+              />
+            </li>
+          ))}
+        </ul>
+      )}
+
       <div className="grid gap-3 lg:grid-cols-2">
         {c.valuation && <ValuationChart d={c.valuation} />}
         {c.profit && <ProfitChart d={c.profit} />}
@@ -183,6 +214,11 @@ function ValuationChart({ d }) {
     p90: '#fda4af',
   }
 
+  // 分位必须连着窗口一起说。「处于自身历史 8 分位」读起来是「上市以来的低位」，
+  // 而重建序列实际只有 1–2 年——两句话对读者是两件事。窗口的首尾日期直接取自
+  // 这条曲线的两端（首尾两点在抽稀时必留），不另算一个数出来。
+  const win = `${d.series[0].label} ~ ${d.series[n - 1].label}`
+
   return (
     <CardShell
       title="估值分位带"
@@ -200,11 +236,11 @@ function ValuationChart({ d }) {
           )}
         </div>
       }
-      footer={`${d.note}　当前 PE ${d.latest}，处于自身历史 ${d.percentile} 分位${
+      footer={`${d.note}　当前 PE ${d.latest}，处于自有可重建区间（${win}）的 ${d.percentile} 分位${
         d.relative_gap != null
           ? `；重建值与官方 pe_ttm 相对偏差 ${(d.relative_gap * 100).toFixed(1)}%`
           : ''
-      }。`}
+      }。该区间不是「自上市以来」，跨度过短时分位的绝对水平只宜作趋势参考。`}
     >
       <Frame sc={sc} fmt={(v) => v.toFixed(0)}>
         {bandOrder.map((k) =>

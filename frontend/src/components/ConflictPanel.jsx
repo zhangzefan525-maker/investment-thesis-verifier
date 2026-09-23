@@ -34,9 +34,19 @@ export default function ConflictPanel({ run }) {
                 <span className="rounded bg-ink-900 px-1.5 py-0.5 font-mono text-[10px] text-white">
                   {c.sub_question_id}
                 </span>
-                <span className="text-[11px] text-ink-500">
-                  涉及证据 {c.evidence_ids.join(' · ')}
-                </span>
+                {/* 只渲染真实存在的证据编号。另一端若不是证据卡（例如官方快照里的一个数值），
+                    后端会把它写在 counterparty 里单独标为「对照」——
+                    此前那一端被编成一个 id 混进这句话，读者去卡列表里核对会发现它不存在。 */}
+                {c.evidence_ids?.length > 0 && (
+                  <span className="font-mono text-[11px] text-ink-500">
+                    涉及证据 {c.evidence_ids.join(' · ')}
+                  </span>
+                )}
+                {c.counterparty && (
+                  <span className="text-[11px] text-ink-500">
+                    对照：<RichText text={c.counterparty} />
+                  </span>
+                )}
               </div>
 
               <Field title="冲突的性质" body={c.nature} />

@@ -4,9 +4,15 @@
  * 每个场景的停留时长 === 该段旁白的实际时长（从 narration.json 读，
  * 那份文件由 TTS 生成时量出）。这样音画对齐是算出来的，不靠手工掐秒。
  *
+ * 这是三段流水线的中间一段，三段共用同一个 VIDEO_DIR：
+ *   1. python scripts/video/build-narration.py   读 video/scenes.json，逐句合成旁白
+ *   2. node scripts/demo-video.mjs               本文件：录屏，并写 timing.json
+ *   3. python scripts/video/compose.py           按 timing.json 排旁白与字幕，出 demo.mp4
+ * 单独重跑某一段是许可的：每一段只依赖上一段的产物，不依赖内存里的状态。
+ *
  * 用法（先起后端，或直接指向线上）：
  *   UI_BASE=http://39.96.194.197/thesis node scripts/demo-video.mjs
- * 产物：<VIDEO_DIR>/raw/*.webm，再由 ffmpeg 加旁白合成 mp4。
+ * 产物：<VIDEO_DIR>/raw/*.webm 与 <VIDEO_DIR>/timing.json。
  *
  * 注意 VIDEO_DIR 的默认值：Windows 上 `/tmp` 不是 `C:\tmp`，而是
  * `C:\Users\<用户>\AppData\Local\Temp`。写死成 `C:/tmp/vid` 会让
@@ -72,6 +78,29 @@ async function glide(selector, ms = 900) {
   )
 }
 
+/** 平滑滚动到任意元素。用于没有 id 的区块（例如「回答的执行记录」）。 */
+async function glideTo(locator, ms = 900) {
+  const el = await locator.first().elementHandle()
+  if (!el) return
+  await el.evaluate(
+    (node, dur) =>
+      new Promise((res) => {
+        const from = window.scrollY
+        const to = node.getBoundingClientRect().top + window.scrollY - 160
+        const t0 = performance.now()
+        const tick = (t) => {
+          const k = Math.min(1, (t - t0) / dur)
+          const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2
+          window.scrollTo(0, from + (to - from) * e)
+          if (k < 1) requestAnimationFrame(tick)
+          else res()
+        }
+        requestAnimationFrame(tick)
+      }),
+    ms,
+  )
+}
+
 async function verify(text) {
   await page.evaluate(() => window.scrollTo(0, 0))
   await page.fill('textarea', text)
@@ -94,23 +123,45 @@ const scenes = {
     await glide('#conflict', 1100)
   },
   async s4() {
+    // 澄清环节：默认口径不认时，用户自己指定参照系再重跑。
+    // 这一幕要拍全三件事——改判后的标签、被撤下的图、以及执行记录；
+    // 它们在页面的三个位置，所以中间必须停下来让每一处都待够时间。
+    await page.locator('a[href="#parse"]').click()
+    await page.waitForTimeout(600)
+    const panel = page.locator('#parse')
+    await panel.getByRole('button', { name: '与同业比' }).click()
+    await page.waitForTimeout(300)
+    await panel.getByRole('button', { name: /按我的回答重跑/ }).click()
+    await page.waitForFunction(
+      () => !document.body.innerText.includes('正在重跑'),
+      { timeout: 180000 },
+    )
+    // 「改判为无法验证」的标签与「它改变了什么」在这一屏
+    await page.waitForTimeout(3200)
+    await glide('#charts', 1200)
+    // 依据被作废的那张图已从 DOM 里撤下，并写明撤下原因
+    await page.waitForTimeout(4600)
+    // 执行记录。它不是失败清单 —— 旁白最后一句讲的就是这件事。
+    await glideTo(page.getByText('本轮回答的执行记录'), 1200)
+  },
+  async s5() {
     await glide('#falsify', 1100)
     // 展开第一行的「阈值依据」
     const row = page.locator('#falsify tbody tr').first()
     await row.click()
     await page.waitForTimeout(500)
   },
-  async s5() {
+  async s6() {
     await verify(THESIS.squeeze)
     await glide('#evidence', 1300)
   },
-  async s6() {
+  async s7() {
     await glide('#research', 1100)
     await page.getByRole('button', { name: '开始比较' }).click()
     await page.waitForSelector('#research table tbody tr', { timeout: 180000 })
     await page.waitForTimeout(400)
   },
-  async s7() {
+  async s8() {
     await page.getByRole('button', { name: '追问' }).click()
     await page.getByRole('button', { name: '展开这一条' }).click()
     await page.waitForSelector('#research .whitespace-pre-wrap', { timeout: 60000 })
@@ -121,7 +172,7 @@ const scenes = {
     await page.getByRole('button', { name: /存为研究任务/ }).click()
     await page.waitForTimeout(1500)
   },
-  async s8() {
+  async s9() {
     await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
     await page.waitForTimeout(900)
   },

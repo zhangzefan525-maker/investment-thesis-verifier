@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from ..analysis.fundamentals import health_check
 from ..schemas import (
@@ -31,6 +31,7 @@ from ..schemas import (
     ThesisType,
     ValuationChart,
     Verdict,
+    WithheldChart,
 )
 from ..templates.gold import Template
 from .executors import Ctx, _prev_same_period
@@ -61,13 +62,23 @@ def detect_conflicts(
         p_fwd = ctx.series_fwd.percentile("pe_reconstructed")
         p_non = ctx.series_none.percentile("pe_reconstructed")
         if p_fwd is not None and p_non is not None:
-            e1, e2 = by_id.get("SQ-01"), by_id.get("SQ-02")
-            ids = [x.id for x in (e1, e2) if x]
-            if abs(p_fwd - p_non) > 25:
+            e1 = by_id.get("SQ-01")
+            # 这条冲突的两端是**两条序列**（前复权 / 不复权），不是两张卡：
+            # 不复权那条只是同一取数路径下的对照序列，从来没有独立的证据卡。
+            # 早先的写法是 `ids or ["EV-SQ-01"]` —— 一个凭空编出来的 id，
+            # 用来把列表凑到 schema 要求的长度（凑不够 2 会直接抛校验异常）。
+            # 界面会把它当证据编号印出来，读者拿着一串不存在的编号去核对。
+            # 现在如实声明对照的那一端是序列，不编 id。e1 不存在时不出这条冲突：
+            # 一条指不出任何一张卡的冲突，读者无从核对。
+            if abs(p_fwd - p_non) > 25 and e1 is not None:
                 conflicts.append(
                     Conflict(
                         sub_question_id="SQ-01",
-                        evidence_ids=ids or ["EV-SQ-01"],
+                        evidence_ids=[e1.id],
+                        counterparty=(
+                            "不复权口径重建的 PE 序列（与前复权序列同源取数、同一重建方法，"
+                            "仅复权方式不同；本产品不把它作为独立证据卡）"
+                        ),
                         nature=(
                             f"同一标的的估值分位在两种复权口径下出现显著分歧："
                             f"前复权序列给出 {p_fwd} 分位，不复权序列给出 {p_non} 分位，"
@@ -95,15 +106,26 @@ def detect_conflicts(
         gap = ctx.series_fwd.calibration.get("relative_gap")
         e1 = by_id.get("SQ-01")
         if gap is not None and gap > 0.35 and e1:
+            our_pe = ctx.series_fwd.calibration.get("our_latest_pe")
+            off_pe = ctx.series_fwd.calibration.get("official_pe_ttm")
             conflicts.append(
                 Conflict(
                     sub_question_id="SQ-01",
-                    evidence_ids=[e1.id, "SNAPSHOT-PE-TTM"],
+                    # 另一端此前写成 `"SNAPSHOT-PE-TTM"` —— 它不是任何一张证据卡的 id，
+                    # 而是官方快照这个**数值**，被编出来凑 schema 的长度下界。
+                    # 前端把 evidence_ids 逐字渲染成「涉及证据 …」，读者会去卡列表里找它，找不到。
+                    evidence_ids=[e1.id],
+                    counterparty=(
+                        f"扶摇官方估值快照的 pe_ttm = {off_pe}"
+                        f"（随估值快照接口一同取回，作为本条重建序列的对拍基准；"
+                        f"它不是本产品的子问题，故无独立证据卡）"
+                    ),
                     nature=(
-                        f"我们重建的最新 PE 与扶摇官方估值快照给出的 pe_ttm 相对偏差达 {gap:.1%}，"
-                        f"超出 35% 容差。两者都是真实数据，但算法口径不同："
-                        f"官方 pe_ttm 由数据源内部按 TTM 净利润计算，可能与我们的季度合成方式、"
-                        f"少数股东损益处理方式存在差异。"
+                        f"我们重建的最新 PE 为 {our_pe}，扶摇官方估值快照给出的 pe_ttm 为 {off_pe}，"
+                        f"相对偏差达 {gap:.1%}，超出 35% 容差。"
+                        f"两者都是真实数据，但算法口径不同："
+                        f"官方 pe_ttm 由数据源内部按 TTM 净利润计算，"
+                        f"可能与我们的季度合成方式、少数股东损益处理方式存在差异。"
                     ),
                     resolving_priority=ConflictPriority.AUTHORITY,
                     resolution=(
@@ -130,7 +152,8 @@ def detect_conflicts(
                     sub_question_id="SQ-01",
                     evidence_ids=[e_val.id, e_cyc.id],
                     nature=(
-                        f"两条证据指向相反的解读方向：估值分位证据显示 PE 处于历史 {e_val.display_value}，"
+                        f"两条证据指向相反的解读方向：估值分位证据显示 PE 处于"
+                        f"自有可重建区间的 {e_val.display_value}，"
                         f"看起来「便宜」；但周期性检测显示毛利率离散度 {sd:.2f}pp，提示该标的可能存在"
                         f"周期性特征——周期行业的 PE 会在盈利低谷异常走高、盈利高峰异常走低，"
                         f"低 PE 也可能出现在周期顶部。"
@@ -315,11 +338,25 @@ def _decide(
         fund_ref = any(x is Verdict.REFUTE for x in fund_side)
         fund_unknown = all(x is None or x is Verdict.UNVERIFIABLE for x in fund_side)
 
+        # 估值分位的**窗口**必须跟着分位一起出现。
+        # 重建序列的长度由可用报告期数决定，实测 361 / 371 个交易日（约 1.4 年），
+        # 而「处于自身历史低分位」读起来是「上市以来的历史低分位」——
+        # 两句话对读者的含义差得很远，前者最多说明「比最近一年多便宜」。
+        # 这里从证据卡的报告期原样取出窗口，不另算、不另写。
+        e_val = by_id.get("SQ-01")
+        val_win = ""
+        if e_val is not None and e_val.value is not None:
+            val_win = (
+                f"（分位窗口 {e_val.provenance.report_period}，"
+                f"由可用报告期数决定，**不是「自上市以来」**）"
+            )
+
         if not val_ok and val_side is Verdict.REFUTE:
             return (
                 Verdict.REFUTE,
                 f"现有证据**不支持**该命题。{label} 的估值并未回落——"
-                f"重建 PE 当前处于自身历史的中高分位，不满足命题「估值回落」这一前提，"
+                f"重建 PE 当前处于**自有可重建区间**的中高分位{val_win}，"
+                f"不满足命题「估值回落」这一前提，"
                 f"因此无需再讨论基本面是否恶化。",
                 "已完整检验估值侧与基本面侧；由于命题前提不成立，基本面侧证据不作为结论依据。",
             )
@@ -345,29 +382,71 @@ def _decide(
         if not val_ok and not fund_ref and not fund_unknown:
             # 估值侧本身取不到数 —— 结论卡在这里，而不是卡在基本面。
             # 若沿用下面那条「N 条基本面证据落入无法验证」的文案，N 会是 0，读出来是句废话。
+            #
+            # 结论正文里**不粘贴证据卡上的整段原因**。此前这里把
+            # `unverifiable.what_is_needed` 直接拼进正文，而那一段是写给工程看的
+            # （「重建同业各家的 PE 序列需要逐只调历史K线与利润表……」），
+            # 拼进来既不像结论、又常常以「，」收尾，正文里就出现了「，。」。
+            # 结论只说「哪一侧没验成」并指出原因在哪张卡上，具体原因由卡自己讲。
             e1 = by_id.get("SQ-01")
-            why = (
-                e1.unverifiable.what_is_needed
+            tail = (
+                "为什么取不到数、需要补哪一步，写在 SQ-01 那张证据卡上。"
                 if (e1 is not None and e1.unverifiable is not None)
-                else "该侧所需数据不在本产品的取数范围内"
+                else "本轮未取到该子问题所需的数。"
             )
             return (
                 Verdict.UNVERIFIABLE,
                 f"现有证据**不足**以支持或否定该命题。基本面侧未见恶化，"
-                f"但命题的前半句「估值已回落」本轮无法验证：{why}。"
-                f"按本产品规则，命题的一端取不到数时不给出方向性结论 —— "
+                f"但命题的前半句「估值已回落」本轮无法验证 —— {tail}"
+                f"按本产品规则，命题的一端取不到数时不给出方向性结论："
                 f"把无法验证的那一侧当作成立，等于替用户的假设背书。",
-                "命题未被完整覆盖：估值侧落入无法验证，基本面侧证据不作为结论依据。",
+                # 「基本面侧证据不作为结论依据」是错的：上面那句「基本面侧未见恶化」
+                # 恰恰用到了基本面侧的证据。此前那句话否定了同一句结论自己的依据。
+                "命题未被完整覆盖：估值侧落入无法验证，因此不给出方向性结论。",
             )
         if val_ok and not fund_ref and not fund_unknown:
-            names = "、".join(FUND_NAME[s] for s in present_fund)
-            tail = "三项均未见恶化" if len(present_fund) == 3 else "各项均未见恶化"
+            # 三条基本面俱在时，逐字沿用**改动前那一句**（「收入、利润与盈利质量三项均未见恶化」），
+            # 连连接词都用原来的「与」。这一句是默认路径（用户一句都没回答）上真正渲染出来的正文，
+            # 为兼容「SQ-05 被澄清移出」而把它顺手改成顿号连接，就足以让
+            # 「未回答时的行为逐字不变」这条不变量在例题上失效 —— 修一处不该动的措辞，
+            # 换不到任何东西，却让交付文档里的承诺变成假的。
+            if len(present_fund) == 3:
+                fund_clause = "收入、利润与盈利质量三项均未见恶化"
+            else:
+                fund_clause = (
+                    "、".join(FUND_NAME[s] for s in present_fund) + "各项均未见恶化"
+                )
             n_val = sum(1 for s in ("SQ-01", "SQ-02") if by_id.get(s) is not None)
+            # 「周期性」这一句必须按 SQ-06 的**实际状态**写。
+            #
+            # 早先在这里写死了一句「本结论的适用边界受周期性检测结果约束，详见冲突与反转条件」，
+            # 而中国平安那一条的 SQ-06 因有效报告期不足 4 期（保险公司的利润表里没有
+            # operating_costs 这个口径）而算不出离散度，falsification_conditions 对无数值的
+            # 子问题**不生成行**——于是反转条件表里根本没有周期性这一行，读者被指向一个不存在的小节。
+            # 这与「承诺一个界面上没有的控件」是同一类错：句子描述的是它没有做的事。
+            # 更要紧的是方向反了：句子让读者以为周期性已被排雷，实际是**根本没检测**。
+            cyc = by_id.get("SQ-06")
+            if cyc is None:
+                # 澄清把这条移出了本轮范围（如命题收窄），就不该再提它。
+                cyc_clause = ""
+            elif not isinstance(cyc.value, (int, float)):
+                cyc_clause = (
+                    "此外须明说：本轮**未能完成周期性检测**（毛利率多期序列不足 4 期，"
+                    "反转条件表中因此没有对应的监控行），本结论对周期行业的 PE 陷阱未设防，"
+                    "估值分位只能按「未排雷」来读。"
+                )
+            elif cyc.value > 5.0:
+                cyc_clause = (
+                    "需注意：周期性检测提示该标的**存在周期特征**，估值分位不可机械读作「低估」，"
+                    "限制条件与翻转阈值见「冲突与反转条件」。"
+                )
+            else:
+                cyc_clause = "周期性检测未提示显著周期特征，估值分位可作常规解读。"
             return (
                 Verdict.SUPPORT,
-                f"现有证据**支持**该命题。{label} 的估值确已回落（重建 PE 处于自身历史低分位），"
-                f"而{names}{tail}。需注意：本结论的适用边界受周期性检测结果约束，"
-                f"详见冲突与反转条件。",
+                f"现有证据**支持**该命题。{label} 的估值确已回落"
+                f"（重建 PE 处于**自有可重建区间**的低分位{val_win}），"
+                f"而{fund_clause}。{cyc_clause}",
                 f"命题两侧（估值侧 {n_val} 条、基本面侧 {len(present_fund)} 条）均有可用证据支撑。",
             )
         return (
@@ -429,24 +508,78 @@ def _decide(
                 f"核心判据与收入端支持；{'、'.join(blocked)}未提供方向性证据，已在覆盖度中声明。",
             )
         if dissent:
+            # 尾巴上这句讲的是「规模证据在不在场」，而规模证据就是收入端（SQ-01）本身。
+            # 这里踩过**两次**同一个坑：先把 dissent 列表写死（改成了按三态生成），
+            # 但这句话里的结论仍然写死 —— 宁德时代收入端是支持态（+54.80%），
+            # 于是同一页上一边摆着 +54.80% 的支持卡，一边说「缺乏规模证据」。
+            # 改一半等于没改：读者看到的是整句话，不是被改对的那半句。
+            if rev is Verdict.REFUTE:
+                tail = "主营业务并未扩张，利润改善缺乏规模支撑"
+            elif rev is Verdict.SUPPORT:
+                tail = "收入端虽有扩张，但盈利能力同步下降，增长未体现为主营业务质量的改善"
+            else:
+                tail = "收入端是否在扩张无法确认，规模证据本身不可得"
             return (
                 Verdict.REFUTE,
                 f"现有证据**不支持**该命题。虽然非经常性损益对利润的贡献不显著"
                 f"（排除了「靠一次性收益」这一最直接的反例），但 {'、'.join(dissent)} 已转向恶化"
-                f"——利润改善缺乏主营业务扩张的规模证据，「来自主营业务」这一论断因此不成立。",
+                f"——{tail}，「来自主营业务」这一论断因此不成立。",
                 f"五层可做的分解层均已检验；{'、'.join(dissent)} 反对，命题被支撑侧证伪。",
+            )
+        # 兜底分支。能落到这里的状态**不止一种**，措辞必须按实际状态生成。
+        # 早先写死了「支撑侧证据不可得」+「缺可用数据」，但还有一种落法：
+        # 收入端与毛利率端**都是支持态**，挡住结论的是利润归属（SQ-06 少数股东损益占比反对）。
+        # 那时这两句话描述的事情一件也没发生——支撑侧完全可得，缺的也不是数据。
+        if blocked:
+            head = (
+                f"核心判据未发现非经常性损益的显著贡献，但 {'、'.join(blocked)} 缺可用数据，"
+            )
+            why = "无法确认主营业务本身是否在扩张"
+            cov = f"核心判据通过，但 {'、'.join(blocked)} 缺可用数据，命题未被完整覆盖。"
+        else:
+            head = (
+                f"核心判据未发现非经常性损益的显著贡献，收入端与毛利率端均为支持态，"
+                f"但利润归属一项显示增量利润有显著部分并未归属上市公司股东。"
+            )
+            why = (
+                "本产品不据此否定命题——这一条反对的不是「改善来自主营」，"
+                "而是「改善归属于上市公司股东」，两者是不同的论断；"
+                "但在归属口径被稀释的前提下，也不给出一条支持结论"
+            )
+            cov = (
+                f"核心判据与支撑侧均通过，但 {SIDE['SQ-06']} 反对，"
+                f"命题在「归属上市公司股东」这一口径上未被完整覆盖，故整体不判为支持。"
             )
         return (
             Verdict.UNVERIFIABLE,
-            f"现有证据**不足**以支持或否定该命题。核心判据未发现非经常性损益的显著贡献，"
-            f"但支撑侧证据不可得，无法确认主营业务本身是否在扩张。",
-            f"核心判据通过，但 {'、'.join(blocked) or '支撑侧子问题'} 缺可用数据，命题未被完整覆盖。",
+            f"现有证据**不足**以支持或否定该命题。{head}{why}。",
+            cov,
         )
 
     # 传导型
     n_unv = sum(
         1 for s in ("SQ-01", "SQ-04", "SQ-05") if v(s) is Verdict.UNVERIFIABLE
     )
+    # 覆盖度这句必须按 SQ-02 / SQ-03 的**实际三态**写。早先写死了一句
+    # 「成本端与成本转嫁能力两条子问题提供了间接证据，但不足以支撑传导结论」，
+    # 而宁德时代那一例实测下来：SQ-02 是**反对**态（营业成本率累计变动 −2.01pp，
+    # 方向与「上游涨价」相反），SQ-03 则因窗口内成本率并未上升而根本无法判定。
+    # 同一句话于是错了两处：把一条明确反对的证据说成「间接证据」，
+    # 又把一条**没跑出结论**的证据说成「提供了证据」。
+    # 这正是本仓库反复记录的那一类错——证据卡上的状态换了，结论的措辞没跟着换。
+    cost_side, pass_side = v("SQ-02"), v("SQ-03")
+    if cost_side is Verdict.SUPPORT:
+        cost_clause = "成本端确有显著变化，间接支持传导链条的前半段"
+    elif cost_side is Verdict.REFUTE:
+        cost_clause = "成本端在观察窗口内并未发生显著变化，传导链条的前半段因此不成立"
+    else:
+        cost_clause = "成本端序列不足以计算，链条前半段无从观测"
+    if pass_side is Verdict.SUPPORT:
+        pass_clause = "成本转嫁能力一项显示公司具备把成本压力转给下游的定价权"
+    elif pass_side is Verdict.REFUTE:
+        pass_clause = "成本转嫁能力一项显示公司不具备向下游转嫁成本的能力"
+    else:
+        pass_clause = "成本转嫁能力不可判定（窗口内成本率未上升，命题预设的前提没有出现）"
     return (
         Verdict.UNVERIFIABLE,
         f"现有证据**不足**以支持或否定该命题。本类命题的核心前提——"
@@ -456,7 +589,9 @@ def _decide(
         f"本产品诚实地把这个命题标记为不可验证，并已指出需要什么数据、从哪里可以获得。"
         f"把一个不可验证的命题标为「已验证」，比标为「无法验证」危险得多。",
         f"{n_unv} 个关键子问题因数据源能力边界落入无法验证；"
-        f"成本端与成本转嫁能力两条子问题提供了间接证据，但不足以支撑传导结论。",
+        f"另两条属于链条中段的信息——{cost_clause}，{pass_clause}。"
+        f"但这两条既不足以为传导结论提供支持，也不足以否定它："
+        f"链条两端的「标的位置」与「外部变量」本身不可观测，中段信息无从挂靠。",
     )
 
 
@@ -480,12 +615,35 @@ def _next_disclosure(today: Optional[date] = None) -> str:
     return "年内已无定期报告节点"
 
 
-def build_charts(ctx: Ctx) -> Optional[Charts]:
+def _invalidated_by_clarification(evidence: list[Evidence], sq_id: str) -> bool:
+    """该子问题的判定是不是**被澄清环节整体作废**的（而不是取数得来的）。
+
+    判据是证据卡的溯源终点：澄清环节改判的卡片，endpoint 写的是
+    "(clarification: ...)"，它没有对应的取数调用；取数路径生成的卡片不会这样写。
+
+    为什么不用「value is None」来判：样本不足、取数失败、异常退出也都会是 None，
+    但那些情形下序列本身就不存在或不完整，图要么没有、要么本来就画不全；
+    这里要抓的是**序列好端端地在 ctx 里，而使用它的那条证据已经被撤了**——
+    图会继续把它画出来并印上一个不该再出现的数值。
+    """
+    for e in evidence:
+        if e.sub_question_id == sq_id:
+            return e.provenance.endpoint.startswith("(clarification")
+    return False
+
+
+def build_charts(ctx: Ctx, evidence: Optional[list[Evidence]] = None) -> Optional[Charts]:
     """把本次已经取到的数据整理成三张图。
 
     **不发起任何新的取数**——图上每一个点都能在证据卡里找到出处。
     图只是同一批证据的另一种呈现方式，不是新的论据来源。
+
+    `evidence` 传入后，本函数会检查每张图所依据的子问题是否已被作废；
+    被作废的图撤下来并写进 `withheld`，而不是照旧画出来 ——
+    细节见 `_invalidated_by_clarification` 与 `Charts.withheld`。
     """
+    evidence = evidence or []
+    withheld: list[WithheldChart] = []
     val = None
     s = ctx.series_fwd
     if s is not None:
@@ -529,6 +687,27 @@ def build_charts(ctx: Ctx) -> Optional[Charts]:
                     "绝对水平只作参考。"
                 ),
             )
+
+    # 估值图绑定的是 SQ-01。若 SQ-01 已被澄清环节作废，这张图就**没有出处的证据卡**了。
+    # 撤下来，并把原因写明白——静默省略与照旧展示都不行：
+    # 静默省略会让「用户选了口径 → 图消失」看起来像 bug；照旧展示则更糟，
+    # 屏幕上会留着一个用户刚刚拒绝过的口径算出来的分位，而且它还带着「当前 PE x，y 分位」
+    # 这种读起来就是答案的页脚。
+    if val is not None and _invalidated_by_clarification(evidence, "SQ-01"):
+        withheld.append(
+            WithheldChart(
+                name="估值分位带图（重建 PE 序列）",
+                backs_sub_question="SQ-01",
+                reason=(
+                    "SQ-01（估值分位）在本轮被澄清环节改判为无法验证 —— 用户把参照系指定成了"
+                    "另一种口径，而本产品没有那条取数路径。参照系一换，这张按「自有可重建区间」"
+                    "重建的 PE 序列就不再对应用户要问的那个问题；把它继续画出来，"
+                    "等于把用户刚刚拒绝的口径的数字塞回屏幕上。"
+                    "本图撤下而不是加注「仅供参考」：图上印着一个分位，它就会被当成答案。"
+                ),
+            )
+        )
+        val = None
 
     periods: list[str] = []
     rev: list[Optional[float]] = []
@@ -575,9 +754,9 @@ def build_charts(ctx: Ctx) -> Optional[Charts]:
             cost_ratio=[round(x, 2) for x in cr],
         )
 
-    if val is None and profit is None and margin is None:
+    if val is None and profit is None and margin is None and not withheld:
         return None
-    return Charts(valuation=val, profit=profit, margin=margin)
+    return Charts(valuation=val, profit=profit, margin=margin, withheld=withheld)
 
 
 def _day(ms: int) -> str:
@@ -611,21 +790,37 @@ def falsification_conditions(
         flips: str,
         impact: str,
         basis: str,
+        latched_when: "Callable[[float], bool] | None" = None,
     ) -> None:
-        """从证据卡取当前值。证据卡缺失或无数值时**不生成该行**——宁可少一行，不可编一个数。"""
+        """从证据卡取当前值。证据卡缺失或无数值时**不生成该行**——宁可少一行，不可编一个数。
+
+        `latched_when` 判断**当前值是否已经满足触发阈值**。这张表的名字叫「反转条件」，
+        读者默认它讲的是「未来可能发生的事」；但实测里确实存在已经越线的行：
+        贵州茅台的归母净利润同比已经是 −1.95%（阈值是「由正转负」），
+        宁德时代传导型那行的成本率变动已经是 −2.01pp（阈值是「回到 3pp 以内」）。
+        这两行此前被原样展示成待触发的风险，读者据此会认为结论还很稳——方向正好反了。
+        传 None 表示该行的阈值不是「当前值已经越线」这种形态（例如现金含量那两行）。
+        """
         e = by_id.get(sid)
         if e is None or e.value is None:
             return
+        latched = False
+        if latched_when is not None:
+            try:
+                latched = bool(latched_when(float(e.value)))
+            except (TypeError, ValueError):
+                latched = False
         conds.append(
             FalsificationCondition(
                 monitored_variable=variable,
                 current_value=f"{e.display_value}（{e.provenance.report_period}）",
                 trigger_threshold=threshold,
-                direction=direction,
+                direction=f"已触发 · 原本监测「{direction}」" if latched else direction,
                 flips_sub_question=flips,
                 marginal_impact=impact,
                 next_disclosure=nxt,
                 threshold_basis=basis,
+                already_triggered=latched,
             )
         )
 
@@ -669,6 +864,7 @@ def falsification_conditions(
                 "0% 是「增长 / 萎缩」的会计分界，不是经验取值。"
                 "收入同比转负意味着主营规模开始收缩，命题「基本面未恶化」的前提直接消失。"
             ),
+            latched_when=lambda x: x < 0,
         )
         add(
             "SQ-04",
@@ -678,6 +874,7 @@ def falsification_conditions(
             flips="SQ-04 利润端未恶化 → 恶化了",
             impact="high",
             basis="同上，0% 是盈亏增长的分界。",
+            latched_when=lambda x: x < 0,
         )
         cash_row("SQ-05", "SQ-05 盈利质量未恶化 → 恶化了")
         add(
@@ -692,6 +889,7 @@ def falsification_conditions(
                 "SQ-01 的 PE 分位就不能再被读作「便宜」，结论从「估值回落」"
                 "退化为「估值处于历史低位，但周期位置未知」。"
             ),
+            latched_when=lambda x: x > 5.0,
         )
 
     elif ttype is ThesisType.ATTRIBUTION:
@@ -709,6 +907,7 @@ def falsification_conditions(
                 "2pp 取自本产品 SQ-03 的判定阈值，含义是「非经常性损益对 ROE 的贡献超过 2 个百分点」，"
                 "此时它在利润中的权重已不容忽视。该阈值在模板中事先写定，不随个案调整。"
             ),
+            latched_when=lambda x: x > 2.0,
         )
         add(
             "SQ-01",
@@ -721,6 +920,7 @@ def falsification_conditions(
                 "0% 是「增长 / 萎缩」的会计分界。归因型命题的完整表述是「盈利改善**来自主营业务**」，"
                 "收入转负意味着产生利润的主业本身在收缩，「来自主营业务」的规模基础不复存在。"
             ),
+            latched_when=lambda x: x < 0,
         )
         add(
             "SQ-02",
@@ -734,19 +934,30 @@ def falsification_conditions(
                 "属于产品结构与季度节奏造成的正常波动，本产品的判据在该区间内不做方向性判断；"
                 "越过 −1pp 才构成「主业盈利能力恶化」的证据。"
             ),
+            latched_when=lambda x: x < -1.0,
         )
+        # SQ-04 的触发条件是两个条件的**合取**，不能只看费用率降幅。
+        # 判据原文是「费用率下降 > 1pp 且收入增速 ≤ 0 → 反对；费用率下降但收入同步增长 → 支持（规模效应）」。
+        # 早先这一行只写了「降幅超过 1pp」，把一个合取条件写成了单条件——
+        # 宁德时代实测费用率降幅 −2.35pp（早已越过 1pp），但同期收入同比 +54.80%，
+        # 该条的实际判定是**支持**。按单条件算，这一行会被标成「已触发」，
+        # 而它描述的翻转根本没有发生，读者反而会以为结论已被削弱。
+        rev_e = by_id.get("SQ-01")
+        rev_val = rev_e.value if (rev_e is not None and isinstance(rev_e.value, (int, float))) else None
         add(
             "SQ-04",
             variable="期间费用率同比变动",
-            threshold="降幅超过 1pp（由中性转为「省出来的」）",
+            threshold="降幅超过 1pp **且同期收入未增长**（由中性或支持转为「省出来的」）",
             direction="下行突破",
-            flips="SQ-04 中性 → 反对（利润改善被归因于费用压缩而非主业变强）",
+            flips="SQ-04 中性/支持 → 反对（利润改善被归因于费用压缩而非主业变强）",
             impact="medium",
             basis=(
-                "1pp 取自本产品 SQ-04 判据的分界。费用率降幅超过 1pp 且收入未同步增长时，"
-                "本条判为「省出来的」并转为反对——降本增效与主业变强是两回事，"
-                "这个阈值就是用来把两者分开的。"
+                "1pp 取自本产品 SQ-04 判据的分界；「收入未增长」（≤0%）是与它并列的第二个条件。"
+                "两个条件必须同时成立才判为「省出来的」——费用率降幅大而收入同步增长属于规模效应，"
+                "那是主业变强的证据而不是相反。降本增效与主业变强是两回事，"
+                "这个阈值组合就是用来把两者分开的。"
             ),
+            latched_when=lambda x: x < -1.0 and rev_val is not None and rev_val <= 0,
         )
         cash_row("SQ-05", "SQ-05 利润的现金支撑 → 恶化了")
 
@@ -763,6 +974,7 @@ def falsification_conditions(
                 "「外部成本变化」这个命题前提本身就不成立了——"
                 "没有成本变化，就谈不上成本在产业链上如何分配。"
             ),
+            latched_when=lambda x: abs(x) <= 3.0,
         )
         conds.append(
             FalsificationCondition(

@@ -773,3 +773,292 @@ def test_confidence_is_declared_on_every_evidence(offline_runs, cid):
         assert ev.display_value.strip()
         assert ev.decision_rule_applied.strip()
         assert ev.threshold_applied.strip()
+
+
+# ==========================================================================
+# 第 10 层：结论、证据卡与反转条件表必须讲同一件事
+#
+# 这一层是补一轮审计发现的四类「说了它没做的事」时长出来的。它们的共同形状是：
+# **证据卡上的状态变了，别处的措辞没跟着变**。这类错不抛异常、不崩页面，
+# 只是让读者读到一个与屏幕另一半相矛盾的句子——最难靠人工发现的那一类。
+# ==========================================================================
+
+
+def _row(tv, keyword: str):
+    """按监控变量的关键词取反转条件行；取不到直接失败，不返回 None 让断言静默通过。"""
+    hits = [c for c in tv.conclusion.falsification_conditions if keyword in c.monitored_variable]
+    assert len(hits) == 1, f"含「{keyword}」的反转条件行为 {len(hits)} 条，期望恰好 1 条"
+    return hits[0]
+
+
+@pytest.mark.parametrize("cid", ALL_CASES)
+def test_cyclicality_claim_matches_the_cyclicality_row(offline_runs, cid):
+    """结论里关于周期性的那句话，必须与反转条件表里**有没有**周期性那一行一致。
+
+    实测的错误：中国平安的结论无条件地写着「本结论的适用边界受周期性检测结果约束，
+    详见冲突与反转条件」，而该例的反转条件表里根本没有周期性这一行
+    （SQ-06 的毛利率序列不足 4 期算不出离散度，本表对无数值的子问题不生成行），
+    冲突块也因为 0 条冲突而整块不渲染。读者被指向一个不存在的小节。
+
+    注意方向：**结论说「没检测」→ 表里就不能有那一行**；反过来不成立——
+    结论被判为不支持时，估值分位已不承载论证，周期性自然不必再提，
+    这时表里留着那一行是对的（它是给未来的监控项）。
+    """
+    tv = offline_runs[cid]
+    stmt = tv.conclusion.statement
+    has_row = any("周期性" in c.monitored_variable for c in tv.conclusion.falsification_conditions)
+    if "未能完成周期性检测" in stmt:
+        assert not has_row, "结论说周期性检测没做成，表里却摆着一行周期性监控——两者不可能同时为真"
+    if "受周期性检测结果约束" in stmt or "存在周期特征" in stmt:
+        assert has_row, "结论声称周期性检测约束了本结论，但反转条件表里没有那一行可看"
+    # 背离型且结论为「支持」时，估值分位正是论证的支点，必须交代周期性的处置方式。
+    if tv.parsed.thesis_type.value == "divergence" and tv.conclusion.verdict is Verdict.SUPPORT:
+        assert "周期性" in stmt, "支持结论建立在估值分位上，却没有交代周期性检测的结果"
+
+
+def test_pingan_conclusion_does_not_promise_cyclicality_it_never_computed(offline_runs):
+    """中国平安：SQ-06 取数成功，但保险公司的利润表里没有 operating_costs 这一行，
+    毛利率序列凑不满 4 期，周期性**根本没检测**。
+
+    修复前，结论写的是「本结论的适用边界受周期性检测结果约束」——它让读者以为
+    周期性已经查过、只是加了限制条件，而事实是这一层完全没有设防。方向正好反了：
+    前者读作「结论更稳」，后者才是「结论有一处没排雷」。
+    """
+    tv = offline_runs["pingan_divergence"]
+    assert tv.conclusion.verdict is Verdict.SUPPORT
+    assert "未能完成周期性检测" in tv.conclusion.statement
+    assert "未设防" in tv.conclusion.statement
+    assert not any(
+        "周期性" in c.monitored_variable for c in tv.conclusion.falsification_conditions
+    )
+
+
+@pytest.mark.parametrize("cid", ALL_CASES)
+def test_source_unreachable_cards_really_had_a_failed_fetch(offline_runs, cid):
+    """判为「数据源调用失败」的证据卡，溯源里必须**真的**没有一次成功的取数。
+
+    实测的错误：中国平安的 SQ-06 取数完全成功（24 个字段），只是拿不到毛利率这个口径，
+    卡上的失败原因却写着「未找到 financial_indicators 的取数记录（既无成功返回也无失败记录）」。
+    这句话把「这个口径在该标的的报表里不存在」误报成「这次调用出了故障」——
+    两者的后续动作完全相反：前者要换数据源，后者重试即可。
+    """
+    tv = offline_runs[cid]
+    for ev in tv.evidence:
+        d = ev.unverifiable
+        if d is None or d.category is not UnverifiableCategory.SOURCE_UNREACHABLE:
+            continue
+        assert "/api/" not in ev.provenance.endpoint, (
+            f"{ev.sub_question_id} 判为「数据源调用失败」，但溯源里写着一个成功的接口 "
+            f"{ev.provenance.endpoint}——自相矛盾"
+        )
+        assert "未找到" in d.failure_evidence
+
+
+def test_unverifiable_card_does_not_deny_a_fetch_that_succeeded(offline_runs):
+    """上一条的具体案例：平安 SQ-06 的失败原因必须说清**真实原因**。"""
+    ev = evidence_by_sq(offline_runs["pingan_divergence"], "SQ-06")
+    assert ev.verdict is Verdict.UNVERIFIABLE
+    assert ev.unverifiable is not None
+    assert "未找到" not in ev.unverifiable.failure_evidence
+    assert "取数成功" in ev.unverifiable.failure_evidence
+    assert "不是取数故障" in ev.unverifiable.failure_evidence
+    # 三问之外的这一条：溯源要能看到失败/成功的是哪个接口，否则读者无从复核。
+    assert "/api/" in ev.provenance.endpoint
+
+
+def test_transmission_coverage_note_does_not_call_a_refutation_evidence(offline_runs):
+    """宁德时代传导型：覆盖度说明此前写死「成本端与成本转嫁能力两条子问题提供了间接证据」。
+
+    实测下来，SQ-02 是**反对**态（营业成本率累计变动 −2.01pp，方向与「上游涨价」相反），
+    SQ-03 则因窗口内成本率并未上升而根本判不出来。同一句话错了两处：
+    把一条反对证据说成「间接证据」，又把一条没跑出结论的证据说成「提供了证据」。
+    """
+    tv = offline_runs["catl_transmission"]
+    note = tv.conclusion.coverage_note
+    assert evidence_by_sq(tv, "SQ-02").verdict is Verdict.REFUTE
+    assert evidence_by_sq(tv, "SQ-03").verdict is Verdict.UNVERIFIABLE
+    assert "间接证据" not in note, "SQ-02 是反对态、SQ-03 无法判定，都不构成「间接证据」"
+    assert "并未发生显著变化" in note, "SQ-02 的实际状态（成本端没有显著变化）必须写出来"
+    assert "不可判定" in note, "SQ-03 的实际状态（无法判定）必须写出来"
+
+
+def test_attribution_fallback_prose_follows_the_actual_state():
+    """归因型兜底分支：能落到那里的状态不止一种，措辞必须按状态生成。
+
+    兜底此前写死「但支撑侧证据不可得，无法确认主营业务本身是否在扩张」，
+    可还有一种落法：收入端与毛利率端**都是支持态**，挡住结论的是利润归属那一项。
+    那时这句话描述的事情一件也没发生——支撑侧完全可得，缺的也不是数据。
+    该分支不在四个例题的覆盖范围内，因此这里直接对判定函数构造状态。
+    """
+    from app.engine.pipeline import _decide
+    from app.schemas import ThesisType
+
+    class _E:
+        def __init__(self, verdict, value=None):
+            self.verdict, self.value = verdict, value
+
+    base = {
+        "SQ-01": _E(Verdict.SUPPORT, 0.5),
+        "SQ-02": _E(Verdict.SUPPORT, 2.0),
+        "SQ-03": _E(Verdict.SUPPORT, 1.0),
+        "SQ-06": _E(Verdict.REFUTE, 9.0),
+    }
+    verdict, statement, coverage = _decide(
+        ThesisType.ATTRIBUTION, base, "某标的（000000.SZ）", "命题原文"
+    )
+    assert verdict is Verdict.UNVERIFIABLE
+    assert "支撑侧证据不可得" not in statement
+    assert "缺可用数据" not in coverage
+    assert "归属上市公司股东" in statement
+
+    blocked = dict(base, **{"SQ-01": _E(Verdict.UNVERIFIABLE), "SQ-06": _E(Verdict.SUPPORT, 1.0)})
+    verdict2, statement2, _ = _decide(
+        ThesisType.ATTRIBUTION, blocked, "某标的（000000.SZ）", "命题原文"
+    )
+    assert verdict2 is Verdict.UNVERIFIABLE
+    assert "收入端" in statement2 and "缺可用数据" in statement2
+
+
+@pytest.mark.parametrize("cid", ALL_CASES)
+def test_latched_rows_announce_themselves_in_the_direction_column(offline_runs, cid):
+    """标了 already_triggered 的行，方向栏必须自带「已触发」前缀。
+
+    前端与接口都可能被单独消费：只靠一个布尔字段，任何一处漏读就会把
+    「已经发生的事」原样展示成「将来可能发生的风险」。
+    """
+    tv = offline_runs[cid]
+    for c in tv.conclusion.falsification_conditions:
+        assert isinstance(c.already_triggered, bool)
+        if c.already_triggered:
+            assert c.direction.startswith("已触发"), (
+                f"「{c.monitored_variable}」标了已触发，方向栏却仍写着「{c.direction}」"
+            )
+
+
+def test_rows_whose_threshold_is_already_crossed_are_flagged(offline_runs):
+    """三处实测的越线行，一处是反例。
+
+    这张表叫「反转条件表」，读者默认它讲的是**未来**可能发生的事。
+    把已经发生的事写成待触发的风险，读者会据此认为结论还很稳——方向正好反了。
+    """
+    # ① 贵州茅台：归母净利润同比已经是 −1.95%，阈值是「由正转负」。
+    row = _row(offline_runs["maotai_divergence"], "归母净利润同比增速")
+    assert "-1.95%" in row.current_value
+    assert row.already_triggered is True
+
+    # ② 宁德时代传导型：成本率累计变动 −2.01pp，阈值是「绝对变动回到 3pp 以内」。
+    row = _row(offline_runs["catl_transmission"], "营业成本率累计变动")
+    assert "-2.01pp" in row.current_value
+    assert row.already_triggered is True
+
+    # ③ 反例：宁德时代归因型的费用率，降幅 −2.35pp 早已越过 1pp，
+    #    但同期收入同比 +54.80%，合取条件里的「且收入未增长」没有满足，
+    #    该条的实际判定是**支持**（规模效应）。单看降幅就标已触发是错的。
+    tv = offline_runs["catl_attribution"]
+    row = _row(tv, "期间费用率同比变动")
+    assert "-2.35pp" in row.current_value
+    assert row.already_triggered is False
+    assert evidence_by_sq(tv, "SQ-01").value > 0
+    assert evidence_by_sq(tv, "SQ-04").verdict is Verdict.SUPPORT
+
+    # ④ 未越线的行不许误标：平安的收入同比 +15.01%，离「转负」很远。
+    row = _row(offline_runs["pingan_divergence"], "营业收入同比增速")
+    assert row.already_triggered is False
+
+
+@pytest.mark.parametrize("cid", ALL_CASES)
+def test_declared_window_matches_the_window_actually_used(offline_runs, cid):
+    """拆解面板声明的观察窗，必须与证据卡真正算的那个窗口一致。
+
+    实测的错误：三处模板窗口都写作「最近 8 个报告期」，而取数层固定取 12 期，
+    于是同一个「累计变动」在拆解面板（按 8 期声明）与证据卡（按 12 期计算）里
+    得到两个口径，读者无从判断哪个对。这类错不报异常，只是让两处各说各话。
+
+    这里不比对字面量，而是比对**证据卡报告期一栏里的真实期数**与模板声明的数字。
+    """
+    import re
+
+    from app.engine.collect import HISTORY_LIMIT
+
+    tv = offline_runs[cid]
+    for sq in tv.decomposition.sub_questions:
+        # 只查那些声明了「最近 N 期」的窗口；「最新报告期」这类没有期数，不参与比对。
+        m = re.search(r"最近\s*(\d+)\s*期", sq.time_window)
+        if m:
+            assert int(m.group(1)) == HISTORY_LIMIT, (
+                f"{sq.id} 的窗口声明为「最近 {m.group(1)} 期」，"
+                f"而取数层实际取 {HISTORY_LIMIT} 期——声明与实现必须同源，"
+                f"因此这里应当引用 HISTORY_LIMIT 而不是另写一个字面量"
+            )
+        # 证据卡上的真实期数不得超过声明上限。
+        hits = [e for e in tv.evidence if e.sub_question_id == sq.id]
+        for ev in hits:
+            m2 = re.search(r"最近\s*(\d+)\s*期", ev.provenance.report_period)
+            if m2 and m:
+                assert int(m2.group(1)) <= int(m.group(1)), (
+                    f"{sq.id} 的窗口声明「最近 {m.group(1)} 期」，"
+                    f"证据卡却用了 {m2.group(1)} 期——实际窗口不能超过声明的上限"
+                )
+
+
+# --------------------------------------------------------------------------
+# 估值分位：说分位就必须同时说窗口
+#
+# 重建序列的长度由可用报告期数决定，实测 361 / 371 个交易日（约 1.5 年）。
+# 写成「处于自身历史 X 分位」，读者读到的却是「上市以来的历史低位」——
+# 而两例背离型命题的核心前提（「估值确已回落」）都靠这一句支撑。
+# 分位本身没错，错的是没把「这是多长的历史」说在同一句话里。
+# 窗口的事实来源只有一个：证据卡的 provenance.report_period。
+# --------------------------------------------------------------------------
+
+
+DIVERGENCE_CASES = [c for c in ALL_CASES if c.endswith("divergence")]
+
+
+@pytest.mark.parametrize("cid", DIVERGENCE_CASES)
+def test_percentile_claim_carries_its_own_window(offline_runs, cid):
+    """证据卡上那句「X 分位」必须自带起止日期，且与溯源的报告期一致。"""
+    tv = offline_runs[cid]
+    ev = evidence_by_sq(tv, "SQ-01")
+    win = ev.provenance.report_period
+
+    assert "自有可重建区间" in ev.claim, f"{cid} 的分位 claim 没有说明是哪一段历史：{ev.claim}"
+    assert win in ev.claim, f"{cid} 的 claim 里没有窗口 {win}：{ev.claim}"
+    for banned in ("自身历史", "自上市以来"):
+        assert banned not in ev.claim, f"{cid} 的分位 claim 仍在暗示「{banned}」：{ev.claim}"
+    # 区间长度必须能被读者看出来。实测 1.5 年，与「上市以来」差着数量级。
+    assert "年" in ev.reasoning and "交易日" in ev.reasoning
+
+
+@pytest.mark.parametrize("cid", DIVERGENCE_CASES)
+def test_conclusion_does_not_promise_more_history_than_it_has(offline_runs, cid):
+    """结论正文提到分位时，同样不能把它说成「自身历史」而不给窗口。"""
+    tv = offline_runs[cid]
+    stmt = tv.conclusion.statement
+    if "分位" not in stmt:
+        pytest.skip("本例的结论不以分位为论据")
+    assert "自有可重建区间" in stmt, f"{cid} 的结论把分位说成了别的历史范围：{stmt}"
+    assert tv.conclusion.statement.count("自上市以来") in (0, 1)
+    if "自上市以来" in stmt:
+        # 允许出现，但只能是以「不是自上市以来」这种否定形式出现
+        assert "不是「自上市以来」" in stmt, f"{cid} 的结论正用「自上市以来」修饰分位：{stmt}"
+
+
+@pytest.mark.parametrize("cid", DIVERGENCE_CASES)
+def test_valuation_chart_footer_window_comes_from_the_series(offline_runs, cid):
+    """图表页脚也要带窗口，且窗口取自这条曲线自身的首尾点。
+
+    页脚此前写「处于自身历史 X 分位」，而图上的横轴明明只有一年多。
+    这里的断言落在数据上而不是文案上：首尾点必须与证据卡的窗口同年份区间，
+    这样前端无论怎么拼接那句话，窗口都是真的。
+    """
+    tv = offline_runs[cid]
+    v = tv.charts.valuation
+    if v is None or not v.series:
+        pytest.skip("本例没有估值图")
+    first, last = v.series[0].label, v.series[-1].label
+    win = evidence_by_sq(tv, "SQ-01").provenance.report_period
+    assert win.startswith(first) and win.endswith(last), (
+        f"{cid} 的窗口 {win} 与曲线的首尾点 {first} ~ {last} 不一致——"
+        f"页脚要印的窗口必须取自曲线本身"
+    )

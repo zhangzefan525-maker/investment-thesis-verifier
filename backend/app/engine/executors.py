@@ -103,11 +103,39 @@ def _unv(
     rule: str,
     threshold: str,
 ) -> Evidence:
-    """由取数失败生成一条无法验证证据。"""
+    """由取数失败生成一条无法验证证据。
+
+    这里要分清两种**完全不同**的失败，早先被混成了一种：
+
+    1. 取数路自己失败了（超时、无权限、标的不存在）——`ctx.failures` 里有记录，照实转述。
+    2. **取数成功了，但取回来的数据里没有本条子问题要的字段。**
+
+    第 2 种此前落到 else 分支，写出一句「未找到 <key> 的取数记录（既无成功返回也无失败记录）」。
+    中国平安的 SQ-06 就是这种：`financial_indicators` 取数完全成功，但它是一份保险公司的
+    利润表，「毛利率」这个口径根本不存在（保险公司没有 operating_costs 这一行），
+    于是毛利率序列凑不满 4 期。屏幕上于是出现了一句**明显与事实不符**的话，
+    而真正的原因（该标的的报表结构里没有这个口径）一个字都没说。
+    读者据此会把「这个数据源没有能力」误读成「这次调用出了故障」——
+    两者的后续动作完全相反：前者要换数据源，后者重试即可。
+    """
     err = ctx.failures.get(key)
     if err is not None:
         detail = err.detail
         endpoint = err.endpoint
+    elif key in ctx.procs:
+        # 取数成功但字段不可用。用 DATA_NOT_EXIST 而非 SOURCE_UNREACHABLE：
+        # 报的是「这个口径在该标的的披露结构里不存在」，不是「数据源连不上」。
+        detail = UnverifiableDetail(
+            category=UnverifiableCategory.DATA_NOT_EXIST,
+            what_is_needed=why_needed,
+            where_to_get=where,
+            failure_evidence=(
+                f"{key} 一路取数成功（见本卡溯源），但返回的数据里没有本条子问题可用的字段。"
+                f"本条需要：{why_needed}。失败性质是「该标的的披露口径与本条所需口径不匹配」，"
+                f"**不是取数故障**——重试不会有任何改变，需换数据源或换口径。"
+            ),
+        )
+        endpoint = ctx.procs[key].endpoint
     else:
         detail = UnverifiableDetail(
             category=UnverifiableCategory.SOURCE_UNREACHABLE,
@@ -116,21 +144,39 @@ def _unv(
             failure_evidence=f"未找到 {key} 的取数记录（既无成功返回也无失败记录）",
         )
         endpoint = f"(missing: {key})"
+    # 推理句也要按**是哪一种失败**来写。上一版对三种情形共用一句
+    # 「取数路径未能返回可用数据」，于是「取数其实成功了、只是字段口径不合」也被写成取数失败，
+    # 与下方三问里的证据自相矛盾。溯源里的 endpoint 此前算了却没有用上，
+    # 现在把它接进去：取数失败时，卡上要能看到**失败的是哪个接口**。
+    if err is not None:
+        reasoning = (
+            f"本子问题依赖的取数路径调用失败，因此无法做出支持或反对的判断。"
+            f"失败性质：{detail.category.value}。原始证据：{detail.failure_evidence}"
+        )
+    elif key in ctx.procs:
+        reasoning = (
+            f"取数路径**调用成功**，但返回的数据不含本条子问题所需的字段，因此无法做出支持或反对的判断。"
+            f"失败性质：{detail.category.value}。原始证据：{detail.failure_evidence}"
+        )
+    else:
+        reasoning = (
+            f"本子问题依赖的取数路径未能返回可用数据，因此无法做出支持或反对的判断。"
+            f"失败性质：{detail.category.value}。原始证据：{detail.failure_evidence}"
+        )
     return Evidence(
         id=f"EV-{sub_question_id}",
         sub_question_id=sub_question_id,
         claim=claim,
         value=None,
         display_value="—",
-        provenance=prov(ctx, key, "不可得", "不可得", "-"),
+        provenance=prov(ctx, key, "不可得", "不可得", "-").model_copy(
+            update={"endpoint": endpoint}
+        ),
         decision_rule_applied=rule,
         threshold_applied=threshold,
         verdict=Verdict.UNVERIFIABLE,
         confidence=Confidence.LOW,
-        reasoning=(
-            f"本子问题依赖的取数路径未能返回可用数据，因此无法做出支持或反对的判断。"
-            f"失败性质：{detail.category.value}。原始证据：{detail.failure_evidence}"
-        ),
+        reasoning=reasoning,
         fact_or_logic="fact",
         unverifiable=detail,
     )
@@ -289,7 +335,18 @@ def ex_div_01(ctx: Ctx) -> Evidence:
     calib = s.calibration or {}
     gap = calib.get("relative_gap")
     conf = Confidence.MEDIUM if (gap is None or gap > 0.35) else Confidence.HIGH
-    verdict = Verdict.SUPPORT if pct <= 30 else (Verdict.REFUTE if pct >= 70 else Verdict.REFUTE)
+
+    # 三态与阈值必须是同一件事。此前这里写作 `... else Verdict.REFUTE`，
+    # 30–70 的「中性」被并进了「反对」—— 同一张卡上的 threshold_applied 印着
+    # 「30–70 → 中性」，推理句也写「尚无充分证据表明估值回落」，判定却是「反对」。
+    # 数据取到了、只是落在中性区间不足以定论，对应的正是 INCONCLUSIVE_RANGE
+    # 这个早就定义好、却一直没有被这个执行器用上的分类。
+    if pct <= 30:
+        verdict = Verdict.SUPPORT
+    elif pct >= 70:
+        verdict = Verdict.REFUTE
+    else:
+        verdict = Verdict.UNVERIFIABLE
 
     calib_note = ""
     if gap is not None:
@@ -302,21 +359,45 @@ def ex_div_01(ctx: Ctx) -> Evidence:
     elif calib:
         calib_note = "官方 pe_ttm 为空值（可能因净利润为负），无法完成自校准，本条为中等置信度。"
 
+    if verdict is Verdict.UNVERIFIABLE:
+        detail = UnverifiableDetail(
+            category=UnverifiableCategory.INCONCLUSIVE_RANGE,
+            what_is_needed="分位落入 ≤ 30 或 ≥ 70 的判定区间；或一个覆盖完整周期的参照区间，"
+                           "让「中性」本身具备可比含义",
+            where_to_get="延长重建序列（需更多历史报告期）后重算，或改用较长的观察窗",
+            failure_evidence=f"分位 {pct} 落在 30–70 中性区间，判定规则未给出方向",
+        )
+    else:
+        detail = None
+
+    # 「自身历史」这四个字必须带上窗口。重建序列的长度由可用报告期数决定，
+    # 实测只有 361 / 371 个交易日（约 1.4 年）——写「自身历史分位」，
+    # 读者会读成「上市以来的历史分位」，而实际上这是最近一年多里的位置。
+    # 同一条卡上印着窗口、推理句里也写了样本数，但 claim 是**先被看到**的那一行，
+    # 也是被复制进结论、图表页脚的那一行；先入为主的那句话才要最准。
+    pts = s.metrics["pe_reconstructed"]
+    win = f"{_fmt_ms(pts[0].date_ms)} ~ {_fmt_ms(pts[-1].date_ms)}"
+    # 跨度由序列自身的首尾日期算出，不写「244 个交易日/年」这类常数——
+    # 常数一旦与实际交易日历不符，读者核对不上，而且没人会发现。
+    span_years = (pts[-1].date_ms - pts[0].date_ms) / (365.25 * 24 * 3600 * 1000)
     return _mk(
         ctx, sq,
-        f"重建 PE 当前值 {latest_pe:.2f}，处于自身历史 {pct} 分位",
+        f"重建 PE 当前值 {latest_pe:.2f}，处于自有可重建区间（{win}）的 {pct} 分位",
         latest_pe,
         f"{latest_pe:.2f}（{pct} 分位）",
-        prov(ctx, key, f"{_fmt_ms(s.metrics['pe_reconstructed'][0].date_ms)} ~ "
-                       f"{_fmt_ms(s.metrics['pe_reconstructed'][-1].date_ms)}",
+        prov(ctx, key, win,
              "重建口径：前复权收盘价 ÷ EPS_TTM（EPS 按披露日阶梯跳变）", "倍",
              {"percentile": pct, "latest": round(latest_pe, 4)}),
-        "计算重建 PE 当前值在自身历史序列中的分位；分位越低代表估值越靠近历史低位",
+        "计算重建 PE 当前值在自有可重建区间内的分位；分位越低代表估值越靠近该区间的低位。"
+        "本产品不提供「自上市以来」的分位——重建序列只覆盖可用于重建的最近若干报告期",
         "≤ 30 分位 → 估值确已回落；30–70 → 中性；≥ 70 → 未回落",
         verdict, conf,
-        f"当前重建 PE 为 {latest_pe:.2f}，在自身上市以来的 {pct} 分位（样本 {len(s.metrics['pe_reconstructed'])} 个交易日）。"
+        f"当前重建 PE 为 {latest_pe:.2f}，在自有可重建区间内的 {pct} 分位"
+        f"（样本 {len(pts)} 个交易日，跨度 {span_years:.1f} 年）。"
+        f"该区间**不是「自上市以来」**，跨度过短时分位的绝对水平只宜作趋势参考。"
         f"{calib_note}"
-        f"按判定规则，{pct} 分位{'落在 30 分位以内，估值确已回落' if pct <= 30 else ('处于 30–70 中性区间，尚无充分证据表明估值回落' if pct < 70 else '处于 70 分位以上，估值并未回落')}。",
+        f"按判定规则，{pct} 分位{'落在 30 分位以内，估值确已回落' if pct <= 30 else ('处于 30–70 中性区间，尚无充分证据表明估值回落，故本条判为**无法验证**而非反对' if pct < 70 else '处于 70 分位以上，估值并未回落')}。",
+        unverifiable=detail,
     )
 
 

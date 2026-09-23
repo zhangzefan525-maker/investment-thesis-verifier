@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Header from './components/Header.jsx'
 import ThesisInput from './components/ThesisInput.jsx'
 import ParsedPanel from './components/ParsedPanel.jsx'
@@ -40,11 +40,21 @@ export default function App() {
       .catch((e) => setHealth({ status: 'unreachable', _error: String(e) }))
   }, [])
 
+  // 在途闸门。`loading` 是 state：同一个事件循环里连点两下，两次回调读到的
+  // 都是**渲染时**那个 `false`，于是两个请求都发出去 —— 谁后回来谁的结论就留在屏幕上，
+  // 而用户只点过一次「开始验证」。用 ref 挡住，它在两次回调之间是共享的。
+  // （重跑按钮已由 `busy` 禁用，但那同样是 state，同一次渲染里的两下照样漏。）
+  const inflight = useRef(false)
+
   // `given` 是对澄清问题的回答。空对象 = 不回答，走产品默认假设，
   // 与引入这个参数之前的请求体完全一致。
+  //
+  // `rawText` 默认取文本框当前内容；但按回答重跑时**必须传本轮命题原文**，见下。
   const verify = useCallback(
-    async (given = {}, { keepPrevious = false } = {}) => {
-      if (!text.trim() || loading) return
+    async (given = {}, { keepPrevious = false, rawText = text } = {}) => {
+      const raw = (rawText || '').trim()
+      if (!raw || inflight.current) return
+      inflight.current = true
       setLoading(true)
       setError(null)
       // 首次验证时清空旧结果；按回答重跑时保留，否则整页闪一下白，
@@ -54,7 +64,7 @@ export default function App() {
         const r = await fetch(api('/api/verify'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ raw_text: text.trim(), clarifications: given }),
+          body: JSON.stringify({ raw_text: raw, clarifications: given }),
         })
         const body = await r.json()
         if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`)
@@ -63,16 +73,30 @@ export default function App() {
       } catch (e) {
         setError(String(e.message || e))
       } finally {
+        inflight.current = false
         setLoading(false)
       }
     },
-    [text, loading],
+    [text],
   )
 
   const submit = useCallback(() => verify({}), [verify])
+
+  // 按回答重跑，用的是**本轮正在展示的那句命题**（run.parsed.raw_text），
+  // 而不是文本框里的当前内容。
+  //
+  // 这是一处会静默出错的默认行为：用户改完文本框、又点了「按我的回答重跑」，
+  // 此前会把澄清回答套到那句**刚改过的、还没验证过的**命题上——
+  // 屏幕上仍然出现一句熟悉的命题被验证过，回答却落到了别处，
+  // 既不报错也没有任何提示。回答是用户针对上一轮那句命题给出的，
+  // 两者必须绑定；想验证新写的那句，走「开始验证」。
   const rerunWithAnswers = useCallback(
-    (given) => verify(given, { keepPrevious: true }),
-    [verify],
+    (given) =>
+      verify(given, {
+        keepPrevious: true,
+        rawText: run?.parsed?.raw_text || text,
+      }),
+    [verify, run, text],
   )
 
   // 每个区块只在下游真的有内容时才渲染——空区块比没区块更让人困惑。
@@ -130,7 +154,13 @@ export default function App() {
               <FalsificationTable run={run} />
               <ResearchPanel run={run} />
               <FailurePanel run={run} />
-              <ParsedPanel run={run} onRerun={rerunWithAnswers} busy={loading} />
+              <ParsedPanel
+                run={run}
+                onRerun={rerunWithAnswers}
+                busy={loading}
+                inputText={text}
+                error={error}
+              />
             </div>
           </>
         )}

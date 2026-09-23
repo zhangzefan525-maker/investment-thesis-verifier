@@ -6,8 +6,9 @@
 
 这一层守三件事：
 
-1. **不回答时行为不变**。四条例题的既定结论不能被这个功能改动，
-   所以「未回答」路径必须与引入该功能前逐字相同。
+1. **不回答时行为不变**。四条例题的既定结论不能被这个功能改动 ——
+   真正守住它的是 `test_default_path_frozen.py`（与检入仓库的基线逐字段比对）。
+   本文件里那条只证明「不传 answers」与「传空字典」两种写法等价。
 2. **回答了要看得见**。用户的原话要进 v2 的前提，不能悄悄换成默认假设。
 3. **回答要落到子问题上**。只把用户的话抄进一段文案、判定照旧，那是装饰不是功能；
    每一条被声明过的回答都必须能在证据或结论上找到它的作用。
@@ -53,13 +54,20 @@ def maotai():
 # --------------------------------------------------------------------------
 
 
-def test_no_answers_is_byte_identical_to_before(maotai):
-    """不传 answers / 传空字典 / 四个例题：输出必须与既有行为逐字相同。
+def test_omitting_answers_equals_passing_an_empty_dict(maotai):
+    """「不传 answers」与「传空字典」必须完全等价。
 
-    这条是整个功能的护栏。四例的结论是交付物的一部分（视频、文档、README 都引用了它们），
-    一个「顺手改进」把默认假设改掉，等于把例题的结论悄悄换掉。
+    这条**只**证明这一点，别把它当默认路径的护栏用 —— 它拿同一份代码自己和自己比，
+    永远发现不了「这次改动把默认路径改了」。那个不变量在
+    `test_default_path_frozen.py`：与一份检入仓库的、冻结于改动之前的基线逐字段比对。
+    上一次真正的漂移（背离型第 3 问的默认假设文案被顺手改掉）就是从这条测试底下溜过去的。
     """
     assert _stable(maotai) == _stable(_run(MAOTAI, answers={}))
+
+
+def test_default_path_carries_no_journal(maotai):
+    """一句都没回答时，回执必须是空的 —— 没有任何一条回答被执行过。"""
+    assert maotai.answer_journal == []
 
 
 def test_unanswered_clarification_carries_no_answer_field(maotai):
@@ -180,15 +188,43 @@ def test_uncertain_restructuring_claim_lands_in_applicable_scope(maotai):
     assert "未经核实" in r.conclusion.limitations[-1]
 
 
-def test_answering_is_recorded_in_the_failure_transparency_list(maotai):
-    """回答改动了什么，必须出现在用户能看到的清单里。
+def test_answering_is_recorded_in_the_journal_not_in_errors(maotai):
+    """回答改动了什么，必须出现在用户能看到的回执里 —— 但**不能**记成失败。
 
     改判发生在后端，若只在返回值里体现，用户点了重跑却看不出哪里变了，
-    只能怀疑按钮没生效。
+    只能怀疑按钮没生效。可这条回执此前被并进 `errors`，而 errors 的定义是
+    「本次运行中发生的失败」，前端按「失败透明清单」渲染它：用户答一句问题，
+    页面上的失败条数就 +1。回答生效不是失败，两件事必须分开。
     """
     q = maotai.parsed.clarifications[0].question
     r = _run(MAOTAI, answers={q: "与同业比"})
-    assert any("与同业比" in e and "SQ-01" in e for e in r.errors)
+    assert any("与同业比" in e and "SQ-01" in e for e in r.answer_journal)
+    assert not any("与同业比" in e for e in r.errors)
+
+
+def test_journal_says_whether_the_verdict_actually_moved():
+    """回执说的是**实际发生**的动作，不是表里那个动作的名字。
+
+    传导型把链条位置断言成「下游」时，SQ-01 在本轮取数下本来就是「无法验证」
+    （主营构成取不到），撤掉再放回一张新卡并没有改变判定。写「改判为无法验证」，
+    就是在用户点完按钮后唯一那句回执里，把「什么都没变」说成「变了」。
+    反过来，背离型选「与同业比」确实把 SQ-01 从 support 打成了无法验证，那句「改判」才是真的。
+    """
+    base = _run(CATL_TRANS)
+    before = next(e for e in base.evidence if e.sub_question_id == "SQ-01").verdict
+    assert before.value == "unverifiable", "本例的 SQ-01 本应取不到数，前提变了要重写这条测试"
+
+    q = base.parsed.clarifications[2].question
+    r = _run(CATL_TRANS, answers={q: "下游"})
+    line = next(e for e in r.answer_journal if "SQ-01" in e)
+    assert "改判" not in line, f"判定没有变，回执却说改判了：{line}"
+    assert "未变" in line
+
+    m = _run(MAOTAI)
+    q0 = m.parsed.clarifications[0].question
+    assert next(e for e in m.evidence if e.sub_question_id == "SQ-01").verdict.value == "support"
+    r2 = _run(MAOTAI, answers={q0: "与同业比"})
+    assert any("改判为无法验证" in e for e in r2.answer_journal)
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +264,12 @@ def test_unverifiable_effects_name_a_sub_question_that_exists():
     """
     from app.templates.gold import TEMPLATES
 
-    for (t, _idx, _opt), (kind, target, _text) in ANSWER_EFFECTS.items():
+    for (t, _idx, _opt), entry in ANSWER_EFFECTS.items():
+        kind, target, _text = entry[:3]
+        # 表里的值是 3–5 元组：第 4 项是「同时追加到结论适用边界」的那句话，
+        # 只有既改判又要留声明的选项才写；第 5 项是「该口径下真正缺的那份数据」，
+        # 只有会写进改判卡「需要什么数据」一栏的选项才写（见 parse.py 该表上方的说明）。
+        assert 3 <= len(entry) <= 5, f"{t.value}/{_opt} 的效果元组长度是 {len(entry)}"
         if kind in {"unverifiable", "drop"}:
             assert target, f"{t.value} 的 {kind} 动作没有指定子问题"
             ids = {s.id for s in TEMPLATES[t].sub_questions}
@@ -336,6 +377,306 @@ def test_apply_answer_effects_is_a_noop_without_answers(maotai):
 
 def test_lookup_effect_returns_none_kind_for_unregistered_input():
     """查不到就如实返回「无效果」，不许猜一个最接近的效果出来。"""
-    kind, target, text = _lookup_effect(ThesisType.DIVERGENCE, 0, "与火星比")
-    assert kind == "none" and target == ""
-    assert "不会" in text
+    eff = _lookup_effect(ThesisType.DIVERGENCE, 0, "与火星比")
+    assert eff.kind == "none" and eff.target == ""
+    assert "不会" in eff.text
+    assert eff.limitation == "" and eff.what_is_needed == ""
+
+
+# --------------------------------------------------------------------------
+# 七、回答生效之后，屏幕上的每一句话都得跟着换
+#
+# 这一层来自一次对抗式审计：它逐条去核「界面上（或选项文案里）写着的事，
+# 代码里有没有东西兑现」。下面每一条都是一处实测过的落空，形状完全一样 ——
+# 判定换了，措辞没换；或者承诺写了，动作没写。
+# --------------------------------------------------------------------------
+
+
+def test_chart_backed_by_an_invalidated_sub_question_is_withheld():
+    """依据被作废的图必须撤下，并说清为什么 —— 不能照旧画，也不能悄悄没了。
+
+    图表与证据是两条代码路径：图只读取数结果（`build_charts(ctx)`），
+    不知道澄清环节已经把 SQ-01 判成「口径不可得」。实测：回答「与同业比」后，
+    结论区写着「估值侧落入无法验证、不给方向性判断」，
+    而图表页脚照旧印着「当前 PE 23.47，处于自身历史 8.0 分位」——
+    那个数正是用户刚刚拒绝的那个口径算出来的。
+    """
+    base = _run(MAOTAI)
+    assert base.charts.valuation is not None
+    assert base.charts.withheld == []
+
+    q = base.parsed.clarifications[0].question
+    r = _run(MAOTAI, answers={q: "与同业比"})
+
+    assert r.charts.valuation is None, "SQ-01 已判为口径不可得，估值图却还在"
+    assert len(r.charts.withheld) == 1
+    w = r.charts.withheld[0]
+    assert w.backs_sub_question == "SQ-01"
+    assert "无法验证" in w.reason and "撤下" in w.reason
+    # 撤下的只是这一张：其它图依据的是别的子问题，不许连坐
+    assert r.charts.profit is not None
+    assert r.charts.margin is not None
+
+
+def test_other_answers_do_not_withhold_the_valuation_chart():
+    """反向：不涉及 SQ-01 的回答不能把估值图误撤下来。"""
+    base = _run(MAOTAI)
+    q = base.parsed.clarifications[1].question  # 命题范围：仅收入与利润（去掉的是 SQ-05）
+    r = _run(MAOTAI, answers={q: "仅收入与利润"})
+    assert r.charts.withheld == []
+    assert r.charts.valuation is not None
+
+
+def test_invalidated_predicate_only_fires_on_clarification_cards():
+    """判据本身：只有澄清环节改判的卡才算「被作废」，取数得来的卡不算。
+
+    用「value is None」当判据会把样本不足、取数失败一并算进来 ——
+    那些情形下序列本身就不存在或不完整，图要么没有、要么本来就画不全；
+    要抓的是「序列好端端在 ctx 里，而用它的那条证据已经撤了」。
+    """
+    from app.engine.pipeline import _invalidated_by_clarification
+    from app.schemas import (
+        Confidence,
+        Evidence,
+        Provenance,
+        UnverifiableCategory,
+        UnverifiableDetail,
+        Verdict,
+    )
+
+    def card(endpoint: str) -> Evidence:
+        return Evidence(
+            id="EV-SQ-01",
+            sub_question_id="SQ-01",
+            claim="x",
+            value=None,
+            display_value="—",
+            provenance=Provenance(
+                source="同花顺扶摇",
+                endpoint=endpoint,
+                report_period="—",
+                caliber="—",
+                unit="—",
+            ),
+            decision_rule_applied="—",
+            threshold_applied="—",
+            verdict=Verdict.UNVERIFIABLE,
+            confidence=Confidence.LOW,
+            reasoning="—",
+            unverifiable=UnverifiableDetail(
+                category=UnverifiableCategory.SOURCE_UNREACHABLE,
+                what_is_needed="y",
+                where_to_get="z",
+                failure_evidence="w",
+            ),
+        )
+
+    data_card = card("GET /api/a-share/prices/historical")
+    clar_card = card("(clarification: 用户在界面上指定的口径，非接口调用)")
+    assert _invalidated_by_clarification([data_card], "SQ-01") is False
+    assert _invalidated_by_clarification([clar_card], "SQ-01") is True
+    assert _invalidated_by_clarification([], "SQ-01") is False
+    # 问的不是这条子问题时不许误伤
+    assert _invalidated_by_clarification([clar_card], "SQ-02") is False
+
+
+def test_conflict_counterparty_is_declared_and_ids_all_exist():
+    """冲突里出现的证据 id 必须**张张真实存在**；不是卡的那一端要显式声明。
+
+    实测踩到两种编 id 的写法，都在同一条冲突上：
+      * `[e1.id, "SNAPSHOT-PE-TTM"]` —— 后者是官方快照里的一个**数值**，
+        前端把它渲染成「涉及证据 SNAPSHOT-PE-TTM」，读者去卡列表里找不到；
+      * `ids or ["EV-SQ-01"]` —— 兜底用的假 id，凑 schema 的长度下界。
+
+    这一例（宁德时代套背离型模板）实测重建偏差 43.2%，正是会走到这条冲突的那一条。
+    """
+    raw = "我认为宁德时代估值已经回落但基本面并没有恶化"
+    r = _run(raw)
+    ids = {e.id for e in r.evidence}
+
+    high_gap = [c for c in r.conclusion.conflicts if "相对偏差达" in c.nature]
+    assert high_gap, "这一例本应触发「重建偏差超容差」的冲突；触发条件变了就要改这条测试"
+
+    c = high_gap[0]
+    for eid in c.evidence_ids:
+        assert eid in ids, f"冲突引用了不存在的证据 {eid}"
+    assert c.counterparty and "pe_ttm" in c.counterparty, "另一端是数值，必须在 counterparty 里说清楚"
+
+    # 全部四例：任何一条冲突都不许出现查无此卡的 id
+    for raw in (MAOTAI, CATL_ATTR, CATL_TRANS):
+        rr = _run(raw)
+        known = {e.id for e in rr.evidence}
+        for cc in rr.conclusion.conflicts:
+            assert all(i in known for i in cc.evidence_ids), f"{raw} 的冲突引用了不存在的证据"
+
+
+def test_external_variable_answer_lands_in_the_conclusion_not_the_card():
+    """外部变量四个选项承诺的是「写进结论的适用边界」，实现就必须是这条。
+
+    早先四个选项都写着「会把『需要什么数据』写成用户真正关心的那一个」，
+    而 limitation 这条路径只往 conclusions.limitations 追加一句话，
+    从不触碰任何证据卡上的文字 —— 四次承诺，四次没发生。
+    """
+    base = _run(CATL_TRANS)
+    q = base.parsed.clarifications[0].question
+    base_lims = list(base.conclusion.limitations)
+    before = {(e.sub_question_id, e.verdict, e.display_value) for e in base.evidence}
+
+    for opt in ("原材料价格", "下游需求", "政策变化", "行业景气度"):
+        r = _run(CATL_TRANS, answers={q: opt})
+        added = [x for x in r.conclusion.limitations if x not in base_lims]
+        assert len(added) == 1, f"回答「{opt}」后结论适用边界增加了 {len(added)} 条"
+        assert opt in added[0]
+
+        c = next(x for x in r.parsed.clarifications if x.question == q)
+        assert "适用边界" in c.impact, "文案要说清它真的会做什么"
+        assert "需要什么数据" not in c.impact, "不再承诺一次并不存在的改写"
+
+        after = {(e.sub_question_id, e.verdict, e.display_value) for e in r.evidence}
+        assert before == after
+
+
+def test_chain_position_assertion_reaches_the_conclusion():
+    """选项承诺「结论会声明：链条位置由用户断言、未经核实」，结论里就必须真有这句。
+
+    实测：这句承诺此前只落在证据卡上（`what_is_needed` 直接引用了它），
+    而结论对象里一个字都没有 —— `conclusion.limitations` 五条，无一提及链条位置；
+    把回答换成上游/中游/下游，结论逐字相同。用户会拿着这句承诺去结论里找。
+    """
+    base = _run(CATL_TRANS)
+    q = base.parsed.clarifications[2].question
+    base_lims = list(base.conclusion.limitations)
+
+    for opt in ("上游", "中游", "下游"):
+        r = _run(CATL_TRANS, answers={q: opt})
+        added = [x for x in r.conclusion.limitations if x not in base_lims]
+        assert len(added) == 1, f"回答「{opt}」后结论里没有这条声明"
+        assert opt in added[0]
+        assert "用户" in added[0] and "未经核实" in added[0]
+        # 结论正文不能反过来把位置说成已核实过的事实
+        assert "未经核实" not in r.conclusion.statement or "用户" in r.conclusion.statement
+
+
+def test_unverifiable_card_does_not_blame_the_data_source():
+    """取数路径的缺口不能写成数据源的缺口。
+
+    「与同业比」做不到，是因为本产品没有「逐只标的拉取再横向拼」这条路径；
+    扶摇**有**历史K线与利润表。写死成「扶摇公开接口不提供该数据」，
+    读者会去申请一个本来就有权限的接口，并以为换个数据源就能解决。
+    """
+    base = _run(MAOTAI)
+    q = base.parsed.clarifications[0].question
+    r = _run(MAOTAI, answers={q: "与同业比"})
+    d = next(e for e in r.evidence if e.sub_question_id == "SQ-01").unverifiable
+
+    assert "扶摇" not in d.where_to_get
+    assert "不提供" not in d.where_to_get
+    # 「需要什么数据」这一栏要答所问：说的是**缺哪份数据**，不是「为什么做不到」。
+    # 此前它填的是整段影响说明，于是同一张卡上「需要什么数据」与「推理」两栏
+    # 出现同一段话，而前者答非所问。
+    assert "历史K线" in d.what_is_needed and "同业可比公司" in d.what_is_needed
+    card = next(e for e in r.evidence if e.sub_question_id == "SQ-01")
+    assert d.what_is_needed != card.reasoning
+    assert d.what_is_needed not in card.reasoning
+
+    # 「判定规则」那一栏此前填的是子问题的**问句**（`sq.text`）——
+    # 卡片上于是出现一句长得像规则、实际是问题的文字。本轮没有套用任何规则，
+    # 就如实这么写，而不是拿问句顶上去。
+    assert card.decision_rule_applied.startswith("本轮未套用判定规则")
+    assert "？" not in card.decision_rule_applied
+
+
+
+# --------------------------------------------------------------------------
+# 八、回答对不上问题时必须被看见
+#
+# 回答以**题面为键**，而题面由命题类型生成。用户改一句命题、或 AI 把类型判成
+# 另一类，整组题面就换掉，上一轮的回答会一条也对不上。此时按默认假设继续是对的，
+# 但必须说出来 —— 此前是静默丢弃：answers.get(q) 取不到就当没回答，errors 里没有痕迹，
+# 而按钮旁写着「有 N 条待生效」。用户答了、产品没听见，却告诉他听见了。
+# --------------------------------------------------------------------------
+
+
+def test_answer_that_matches_no_question_is_reported(maotai):
+    """对不上的回答要原样列出来，且不得因此改动任何下游。"""
+    r = _run(MAOTAI, answers={"一个本轮并不存在的题面": "与同业比"})
+
+    assert r.parsed.unmatched_answers == ["与同业比"]
+    # 听不见就不能装作听见：判定与一句都没回答时完全一致
+    assert [e.verdict for e in r.evidence] == [e.verdict for e in maotai.evidence]
+    assert r.conclusion.statement == maotai.conclusion.statement
+    assert r.answer_journal == []
+
+
+def test_matched_answers_are_not_reported_as_unmatched(maotai):
+    q = maotai.parsed.clarifications[0].question
+    r = _run(MAOTAI, answers={q: "与同业比"})
+    assert r.parsed.unmatched_answers == []
+
+
+def test_a_custom_free_text_answer_is_heard(maotai):
+    """「自己写一句」也算听见了 —— 它不在选项里，但它对上了那道题。"""
+    q = maotai.parsed.clarifications[0].question
+    r = _run(MAOTAI, answers={q: "按 2025 年报口径"})
+    assert r.parsed.unmatched_answers == []
+    assert r.parsed.clarifications[0].answer == "按 2025 年报口径"
+    assert r.parsed.clarifications[0].effect_kind == "none"
+    assert "不会" in r.parsed.clarifications[0].impact
+
+
+def test_effect_kind_is_the_action_that_actually_ran():
+    """前端只有 `impact` 这段自然语言可用时，对所有回答一律写「本轮按你的回答计算」——
+    而只追加边界声明的那些回答**没有改变任何计算**。`effect_kind` 就是给前端的机器可读标签，
+    它必须与表里登记的类型、以及实跑发生的事三者一致。"""
+    probes = [
+        (MAOTAI, 0, "与同业比", "unverifiable"),
+        (MAOTAI, 1, "仅收入与利润", "drop"),
+        (MAOTAI, 2, "不确定", "limitation"),
+        (MAOTAI, 0, "与自身历史比", "none"),
+        (CATL_ATTR, 2, "不确定", "limitation"),
+        (CATL_TRANS, 2, "下游", "unverifiable"),
+        (CATL_TRANS, 1, "一个季度内", "limitation"),
+    ]
+    for raw, idx, opt, want in probes:
+        base = _run(raw)
+        q = base.parsed.clarifications[idx].question
+        r = _run(raw, answers={q: opt})
+        c = r.parsed.clarifications[idx]
+
+        assert c.effect_kind == want, f"{raw[:12]}…第{idx}问选「{opt}」标成了 {c.effect_kind}"
+        assert c.impact, "生效的回答必须说明它改了什么"
+
+        if want == "limitation":
+            # 只加一条边界声明：判定不动，limitations 多一条
+            assert [e.verdict for e in r.evidence] == [e.verdict for e in base.evidence]
+            assert len(r.conclusion.limitations) == len(base.conclusion.limitations) + 1
+        elif want == "none":
+            assert r.conclusion.statement == base.conclusion.statement
+            assert r.conclusion.limitations == base.conclusion.limitations
+        elif want == "drop":
+            gone = {s.id for s in base.decomposition.sub_questions} - {
+                s.id for s in r.decomposition.sub_questions
+            }
+            assert gone, "声明为「移出范围」的回答没有让任何子问题离开本轮"
+            # 正文不得替这条离开的子问题说话 —— 细节见下一节那条测试
+            assert all(s not in r.conclusion.statement for s in gone)
+        elif want == "unverifiable":
+            assert any(
+                e.sub_question_id == "SQ-01" and e.verdict.value == "unverifiable"
+                for e in r.evidence
+            )
+
+
+def test_dropped_sub_question_is_not_spoken_for_in_the_conclusion():
+    """被移出范围的子问题，结论正文里不能再替它说话。
+
+    SQ-05 被移出后，「收入、利润**与盈利质量**三项均未见恶化」这句里
+    就多出了一项没跑过的证据 —— 措辞必须按实际在场的子问题生成。
+    """
+    base = _run(MAOTAI)
+    q = base.parsed.clarifications[1].question
+    r = _run(MAOTAI, answers={q: "仅收入与利润"})
+
+    assert "SQ-05" not in {s.id for s in r.decomposition.sub_questions}
+    assert "盈利质量" not in r.conclusion.statement
+    assert "三层" not in r.conclusion.coverage_note

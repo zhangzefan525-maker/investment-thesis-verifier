@@ -343,7 +343,18 @@ function Tasks({ run }) {
                     <span className={c.marginal_impact === 'high' ? 'text-ref-fg' : 'text-ink-500'}>
                       [{c.marginal_impact === 'high' ? '高' : c.marginal_impact === 'medium' ? '中' : '低'}]
                     </span>{' '}
-                    {c.monitored_variable}　当前 {c.current_value}　→　{c.trigger_threshold}
+                    {c.monitored_variable}　当前 {c.current_value}　→　&#8203;
+                    {/* 阈值文案与主表同源，里面允许出现 **粗体**（它就在后端的
+                        MARKDOWN_FIELDS 清单里）。这里此前是裸渲染，主表那一份却走了 RichText——
+                        同一段文案在两处渲染方式不同，等于两处各错一半。 */}
+                    <RichText text={c.trigger_threshold} />
+                    {/* 复核清单里更要标出来：这份清单是留给用户日后逐条回看的，
+                        把「已经发生」写成「将来会触发」，等于让用户去盯一件已经完成的事。 */}
+                    {c.already_triggered && (
+                      <span className="chip ml-1 border border-ink-900 bg-ink-900 text-white">
+                        已触发
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>

@@ -7,6 +7,14 @@ const IMPACT = {
   low: { zh: '低', cls: 'bg-unv-bg text-unv-fg border-unv-line', note: '只影响局部判断' },
 }
 
+// 「已触发」标记。**刻意不用 sup / ref / unv 三色**：那三色在本产品里只表示
+// 「证据指向哪一边」，一旦被借来表示「这个条件已经满足」，颜色就变成多义的，
+// 而读者是靠着三种颜色秒读整页方向的。这里用一个中性的深色底——它是一个状态标记，
+// 不是一个方向判断。
+const LATCHED_NOTE =
+  '该行的当前值**已经越过**它自己的触发阈值——也就是说，这里写的不再是「未来可能发生的风险」，' +
+  '而是一件已经发生、并已计入上方结论的事。'
+
 export default function FalsificationTable({ run }) {
   const list = run.conclusion?.falsification_conditions || []
   const [open, setOpen] = useState(null)
@@ -50,6 +58,14 @@ export default function FalsificationTable({ run }) {
                   >
                     <td className="td font-medium text-ink-900">
                       <RichText text={f.monitored_variable} />
+                      {f.already_triggered && (
+                        <span
+                          className="chip ml-1 border border-ink-900 bg-ink-900 text-white"
+                          title={LATCHED_NOTE}
+                        >
+                          已触发
+                        </span>
+                      )}
                     </td>
                     <td className="td font-mono text-[11px]">{f.current_value}</td>
                     <td className="td">
@@ -90,6 +106,15 @@ export default function FalsificationTable({ run }) {
       <p className="card-pad border-t border-ink-300/60 text-[11px] text-ink-500">
         点击任意一行展开它的阈值依据。边际影响「高」意味着该变量一旦越过阈值，
         上面那条结论会整体翻转。
+        {list.some((f) => f.already_triggered) && (
+          <>
+            {' '}
+            <span className="chip mx-1 border border-ink-900 bg-ink-900 text-white">
+              已触发
+            </span>
+            <RichText text="标记的行，是**当前值已经越过自己阈值**的行——它们讲的不是未来的风险，而是已经发生、并已计入上方结论的事。把这种行当成「还没触发的条件」来读，会高估结论的稳固程度。" />
+          </>
+        )}
       </p>
     </section>
   )

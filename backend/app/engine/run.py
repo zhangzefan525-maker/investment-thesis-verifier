@@ -157,17 +157,23 @@ def build_decomposition(parsed: ParsedThesis) -> DecompositionResult:
         DecompositionLayer.FX: "扶摇公开接口不提供外币敞口与汇兑损益明细，汇率影响无法拆解",
     }
 
+    # `generated_by` 必须说实话。这里此前写死为 "hybrid"，含义是
+    # 「手工模板 + LLM 实例化」；但没有凭据、或 LLM 调用失败退回规则引擎时，
+    # AI 一个字都没有参与，界面上却仍标着「hybrid」——
+    # 把「AI 参与了」写在一个 AI 没参与的运行上，属于同一类「说了它没做的事」。
+    # 子问题永远来自手工模板（没有任何代码让 AI 产生子问题内容），
+    # 因此只有「类型判定与标的/时间窗抽取」这一步可能由 AI 完成。
     return DecompositionResult(
         sub_questions=subs,
         unable_to_decompose=unable,
         skipped_layers=skipped,
         skipped_layer_reasons={l.value: reasons[l] for l in skipped},
-        generated_by="hybrid",
+        generated_by="hybrid" if parsed.parsed_by == "llm" else "manual_gold_template",
     )
 
 
 def _answer_unverifiable_evidence(
-    parsed: ParsedThesis, sq_id: str, c: ClarificationQuestion
+    parsed: ParsedThesis, sq_id: str, c: ClarificationQuestion, what_is_needed: str = ""
 ) -> Evidence:
     """按用户在澄清环节指定的口径，把一条子问题改判为「无法验证」。
 
@@ -190,7 +196,13 @@ def _answer_unverifiable_evidence(
             unit="—",
             raw={"question": c.question, "answer": c.answer},
         ),
-        decision_rule_applied=sq.text if sq else sq_id,
+        # 这一栏是「判定规则」，不是「子问题问什么」。
+        # 此前填的是 `sq.text`（子问题的问句），卡片上于是出现一句像是规则、实际是问题的文字。
+        # 本轮根本没有套用任何判据，就如实这么写。
+        decision_rule_applied=(
+            "本轮未套用判定规则 —— 该子问题没有按用户在澄清环节指定的口径取到数，"
+            "因此不存在可比对的支持/反对阈值。"
+        ),
         threshold_applied="—",
         verdict=Verdict.UNVERIFIABLE,
         # 高置信度：这不是「拿不准」，而是确定地做不到。给它低置信度会误导读者以为
@@ -200,10 +212,20 @@ def _answer_unverifiable_evidence(
         fact_or_logic="logic",
         unverifiable=UnverifiableDetail(
             category=UnverifiableCategory.DATA_NOT_EXIST,
-            what_is_needed=c.impact,
+            # 「需要什么数据」说的是**缺哪份数据**，不是「为什么做不到」。
+            # 此前这里填的是整段影响说明，于是「需要什么数据」与「推理」两栏
+            # 出现同一段话，而前者答非所问。缺什么，取自 ANSWER_EFFECTS 的第 5 项。
+            what_is_needed=what_is_needed or c.impact,
+            # 这里此前写死了「扶摇公开接口当前不提供该口径所需的数据」——
+            # 而四个会走到这里的选项里，只有一个（分销/分部口径）真是数据源没有，
+            # 另一个（背离型的「与同业比」）扶摇**有**历史K线和利润表，
+            # 缺的是本产品「逐只标的拉取再横向拼」这条取数路径。
+            # 把本产品的能力缺口写成数据源的缺口，读者会去申请一个本来就有权限的接口，
+            # 而且会以为换个数据源就能解决。缺口在哪，就写在哪。
             where_to_get=(
-                "扶摇公开接口（fuyao.aicubes.cn）当前不提供该口径所需的数据，"
-                "本产品亦未接入替代数据源。接入后重跑本命题即可覆盖该子问题"
+                "取数范围不覆盖该口径（具体缺口见「需要什么数据」一栏，与本条回答同源）。"
+                "接入该口径所需的数据源或取数路径后，重跑本命题即可覆盖该子问题；"
+                "本轮不以近似口径顶替。"
             ),
             failure_evidence=(
                 f"澄清环节用户把口径指定为「{c.answer}」，"
@@ -218,13 +240,16 @@ def apply_answer_effects(
     decomposition: DecompositionResult,
     evidence: list[Evidence],
 ) -> tuple[DecompositionResult, list[Evidence], list[str], list[str]]:
-    """把澄清回答落到子问题上，返回 (拆解, 证据, 追加的边界声明, 影响流水)。
+    """把澄清回答落到子问题上，返回 (拆解, 证据, 追加的边界声明, 执行回执)。
 
     回答不落到下游就是装饰。这里只执行 `parse.ANSWER_EFFECTS` 里声明过的动作，
     不在执行期临时发明新的影响 —— 说明文字与实际行为同源于那张表，
     改一处不会只改到一半（早先的写法是文案里写「可修改后重跑」，而根本没有那个控件）。
 
     未回答时不做任何事，返回值与输入逐字相同：四条例题的既定行为不能被这个功能改动。
+
+    返回的「执行回执」由调用方放进 `ThesisVerification.answer_journal`，
+    **不能并进 errors** —— 回答生效不是失败，并进去会让界面上的「失败清单」条数凭空 +1。
     """
     extra_limitations: list[str] = []
     journal: list[str] = []
@@ -237,16 +262,37 @@ def apply_answer_effects(
     for idx, c in enumerate(parsed.clarifications):
         if not c.answer:
             continue
-        kind, target, text = _lookup_effect(parsed.thesis_type, idx, c.answer)
+        eff = _lookup_effect(parsed.thesis_type, idx, c.answer)
+        target = eff.target
 
-        if kind == "limitation":
-            extra_limitations.append(text)
+        if eff.kind == "limitation":
+            extra_limitations.append(eff.text)
             journal.append(f"[{c.question}] → 追加适用边界：{c.answer}")
-        elif kind == "unverifiable":
+            continue
+
+        # 改判类的选项也可以**同时**要求一条适用边界声明（表里的第 4 项）。
+        # 只在 limitation 分支里追加是不够的：传导型把链条位置断言成「下游」时，
+        # 撤销 SQ-01 只改了证据卡，而结论里那个「标的位置」是谁给的、核实过没有，
+        # 只有写进 limitations 才说得清——选项文案承诺的正是这一句。
+        if eff.limitation:
+            extra_limitations.append(eff.limitation)
+            journal.append(f"[{c.question}] → 追加适用边界：{c.answer}")
+
+        if eff.kind == "unverifiable":
+            # 回执必须说实话。传导型把链条位置断言成「下游」时，SQ-01 在本轮取数下
+            # **本来就**是「无法验证」（主营构成取不到），撤掉再放回一张新卡并没有
+            # 改变判定；写成「改判为无法验证」，就是在用户点完按钮后唯一那句回执里
+            # 把「什么都没变」说成「变了」。
+            before = next((e.verdict for e in ev if e.sub_question_id == target), None)
             ev = [e for e in ev if e.sub_question_id != target]
-            ev.append(_answer_unverifiable_evidence(parsed, target, c))
-            journal.append(f"[{c.question}] → {target} 改判为无法验证：{c.answer}")
-        elif kind == "drop":
+            ev.append(_answer_unverifiable_evidence(parsed, target, c, eff.what_is_needed))
+            journal.append(
+                f"[{c.question}] → {target} 的证据卡按你的口径重写"
+                f"（判定仍是「无法验证」，未变）：{c.answer}"
+                if before is Verdict.UNVERIFIABLE
+                else f"[{c.question}] → {target} 改判为无法验证：{c.answer}"
+            )
+        elif eff.kind == "drop":
             layer = next(
                 (
                     s.layer
@@ -261,7 +307,7 @@ def apply_answer_effects(
                 skipped.append(layer)
                 # 跳过原因要写明是「谁让它跳过的」。只写「本层做不到」，
                 # 读者会以为这个缺口本来就存在 —— 而它是这次澄清回答新引入的。
-                reasons[layer.value] = f"由澄清回答「{c.answer}」触发：{text}"
+                reasons[layer.value] = f"由澄清回答「{c.answer}」触发：{eff.text}"
             journal.append(f"[{c.question}] → {target} 移出本轮范围：{c.answer}")
         # kind == "none"：用户的选择与产品默认一致，下游不变。
 
@@ -434,7 +480,13 @@ def run_verification(
     decomposition, evidence, extra_limitations, answer_journal = apply_answer_effects(
         parsed, decomposition, evidence
     )
-    errors.extend(answer_journal)
+    # 回执**不进 errors**。errors 的定义是「本次运行中发生的失败」，前端按
+    # 「失败透明清单」渲染它：把「追加适用边界」塞进去，用户答一句问题就会看到
+    # 失败条数 +1；而它恰恰是回答生效的凭据。放回它自己的字段。
+    #
+    # 这一条做过反向验证：把 `errors.extend(answer_journal)` 放回去、重启后端，
+    # 浏览器里的「回答生效不再被算作失败」与「失败清单如实为空」当场变红。
+    # 未做反向验证的护栏等于没有护栏——它可能恒真。
 
     # 6) 冲突检测
     conflicts = detect_conflicts(ctx, evidence, parsed.thesis_type)
@@ -458,9 +510,12 @@ def run_verification(
         parsed=parsed,
         decomposition=decomposition,
         evidence=evidence,
-        charts=build_charts(ctx),
+        # 图要拿到**改判后**的证据列表：澄清环节可能已经把某条子问题整体作废，
+        # 而图是另一条代码路径（只读 ctx），不传进去它就不知道这件事。
+        charts=build_charts(ctx, evidence),
         conclusion=conclusion,
         data_mode=data_mode,  # type: ignore[arg-type]
         data_mode_note=data_mode_note,
         errors=errors,
+        answer_journal=answer_journal,
     )

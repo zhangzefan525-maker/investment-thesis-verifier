@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from ..schemas import (
     ClarificationQuestion,
@@ -230,7 +230,8 @@ CLARIFY: dict[ThesisType, list[tuple[str, str, list[str], str]]] = {
             "新业务在报表上可能确实计入营业收入，但尚未形成可持续的盈利能力，"
             "会影响 SQ-01 的解读。",
             ["包含", "仅含成熟业务", "不确定"],
-            "按「包含」处理（按报表口径），并在结论中声明该假设",
+            "按「包含」处理（按报表口径）。该假设会随 v2 前提一并披露，"
+            "如口径需要调整可在澄清环节改选后重跑",
         ),
     ],
     ThesisType.TRANSMISSION: [
@@ -272,9 +273,20 @@ CLARIFY: dict[ThesisType, list[tuple[str, str, list[str], str]]] = {
 #   drop         —— 该子问题被移出本轮检验范围，并在跳过层中显式声明
 #   limitation   —— 不改判定，但给结论追加一条适用边界声明
 #   none         —— 用户的选择与本产品默认一致，下游不变
+#
+# 值是 (影响类型, 作用对象, 说明文字[, 追加到结论适用边界的那一句[, 需要什么数据]])。
+# 第 4 项可省略（省略即不追加），只有**同时**要改判又要留边界声明时才写。
+# 它存在的理由：unverifiable 这条路径改的是证据卡，卡本身不进 conclusions.limitations，
+# 而有的选项两边都要——例如传导型把链条位置断言成「下游」，既要撤掉 SQ-01，
+# 又要在结论里写明这个位置是用户断言的、本产品没核实过。只有证据卡说、结论不说，
+# 读者就不会知道结论里那个「标的位置」是谁给的。
+#
+# 第 5 项是**该口径下真正缺的那份数据**，写进改判卡的「需要什么数据」一栏。
+# 此前那一栏填的是整段说明文字（说明讲的是「为什么做不到」，不是「缺什么」），
+# 于是卡片上「需要什么数据」与「推理」两栏出现同一段话，而前者答非所问。
 # --------------------------------------------------------------------------
 
-ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
+ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, ...]] = {
     # --- 背离型 ---
     (ThesisType.DIVERGENCE, 0, "与同业比"): (
         "unverifiable",
@@ -282,6 +294,9 @@ ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
         "SQ-01 的参照系被指定为「同业」，而本轮取数只覆盖用户指定的这一只标的："
         "重建同业各家的 PE 序列需要逐只调历史K线与利润表，本产品当前没有这条取数路径，"
         "因此该子问题判为无法验证，而不是换成「与自身历史比」硬算一个数给用户。",
+        "",
+        "同业可比公司清单，以及这些公司同期的历史K线与利润表"
+        "（扶摇逐只有数，缺的是本产品「逐只拉取再横向拼成一条同业 PE 序列」这条取数路径）",
     ),
     (ThesisType.DIVERGENCE, 0, "与大盘比"): (
         "unverifiable",
@@ -289,6 +304,8 @@ ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
         "SQ-01 的参照系被指定为「大盘」。指数的 PE 分位需要指数自身的盈利序列，"
         "本产品的取数范围只包含标的个股的K线与合并利润表，没有指数盈利数据，"
         "因此该子问题判为无法验证。",
+        "",
+        "指数自身的盈利序列（用于算出指数 PE 及其分位，本产品当前只取个股的利润表）",
     ),
     (ThesisType.DIVERGENCE, 0, "与自身历史比"): (
         "none",
@@ -374,38 +391,50 @@ ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
         "命题口径被收窄为「仅含成熟业务」。要按该口径重算营收同比，必须有分部收入，"
         "而扶摇公开接口不提供分部数据 —— 这正是本产品已声明的 MIX 跳过层的同一个缺口。"
         "因此 SQ-01 判为无法验证，而不是用报表口径的合并营收冒充「成熟业务收入」。",
+        "",
+        "按业务分部拆分的营业收入（分部收入，扶摇公开接口不提供）",
     ),
     (ThesisType.ATTRIBUTION, 2, "不确定"): (
-        "none",
+        "limitation",
         "",
-        "与产品默认处理一致（按报表口径），该假设会在结论中声明。",
+        "用户表示不确定「新业务」是否算作主营业务，本轮按报表口径（包含）处理，"
+        "该假设未经核实，会作为一条边界声明写进结论：若用户本意是剔除尚未形成"
+        "可持续盈利能力的新业务，SQ-01 的收入同比读数会偏乐观。"
+        "用户明确表示不知道时，这条声明就不再是多余的。",
     ),
     # --- 传导型 ---
+    #
+    # 第 0 问（外部变量）的四个选项此前都写着「会把『需要什么数据』写成用户真正关心的那一个」，
+    # 而 limitation 这条路径**只往结论的适用边界追加一句话**，从不触碰任何证据卡上的文字。
+    # 于是四个选项各自承诺了一次改写，四次都没发生 —— 「说了它没做的事」，又一次。
+    # 现在按实际动作改写承诺：写进结论的适用边界，不改卡片。
     (ThesisType.TRANSMISSION, 0, "原材料价格"): (
         "limitation",
         "",
         "外部变量被明确为「原材料价格」。这不改变本轮结论 —— 无论用户指哪个变量，"
-        "本数据源都无法观测它；但它会把「需要什么数据」写成用户真正关心的那一个，"
-        "而不是泛泛的「产业链外部变量」。",
+        "本数据源都无法观测它 —— 因此它写入的是**结论的适用边界**："
+        "本产品要观测的是原材料价格，而该变量及其与成本端的传导关系不在取数范围内。",
     ),
     (ThesisType.TRANSMISSION, 0, "下游需求"): (
         "limitation",
         "",
         "外部变量被明确为「下游需求」。这不改变本轮结论（该变量在本数据源中不可观测），"
-        "但会把「需要什么数据」具体化为下游需求量或订单类指标。",
+        "它写入的是结论的适用边界：本产品要观测的是下游需求量或订单类指标，"
+        "而该口径不在取数范围内。",
     ),
     (ThesisType.TRANSMISSION, 0, "政策变化"): (
         "limitation",
         "",
         "外部变量被明确为「政策变化」。这不改变本轮结论（该变量在本数据源中不可观测），"
-        "但会把「需要什么数据」具体化为相关政策文件与生效时点。",
+        "它写入的是结论的适用边界：本产品要观测的是相关政策文件与生效时点，"
+        "而该口径不在取数范围内。",
     ),
     (ThesisType.TRANSMISSION, 0, "行业景气度"): (
         "limitation",
         "",
         "外部变量被明确为「行业景气度」。这类变量本身缺少可观测定义，"
-        "是本产品判该命题无法验证的直接原因之一；确认这一取值会让「需要什么数据」"
-        "写得更准确，而不是改变结论。",
+        "是本产品判该命题无法验证的直接原因之一；确认这一取值会作为一条适用边界"
+        "写进结论：本产品要观测的是行业景气度，而它既无统一定义、也不在取数范围内。",
     ),
     (ThesisType.TRANSMISSION, 1, "一个季度内"): (
         "limitation",
@@ -432,18 +461,30 @@ ANSWER_EFFECTS: dict[tuple[ThesisType, int, str], tuple[str, str, str]] = {
         "用户把标的在链条中的位置断言为「上游」。该位置需要主营构成来确认，"
         "而扶摇公开接口不提供分部收入，本产品无法核实该断言。"
         "SQ-01 因此判为无法验证，且结论会声明：链条位置由用户断言、未经核实。",
+        "链条位置「上游」由用户在澄清环节断言，本产品**未经核实**——"
+        "核实它需要主营构成，而该数据不在本产品的取数范围内。"
+        "结论中凡出现「标的位置」处，均按用户断言处理。",
+        "主营构成（按业务/产品/地区拆分的分部收入，用于确认标的在链条中的位置）",
     ),
     (ThesisType.TRANSMISSION, 2, "中游"): (
         "unverifiable",
         "SQ-01",
         "用户把标的在链条中的位置断言为「中游」。同上：主营构成不可得，该断言无法核实，"
         "SQ-01 判为无法验证，链条位置在结论中标注为「用户断言、未经核实」。",
+        "链条位置「中游」由用户在澄清环节断言，本产品**未经核实**——"
+        "核实它需要主营构成，而该数据不在本产品的取数范围内。"
+        "结论中凡出现「标的位置」处，均按用户断言处理。",
+        "主营构成（按业务/产品/地区拆分的分部收入，用于确认标的在链条中的位置）",
     ),
     (ThesisType.TRANSMISSION, 2, "下游"): (
         "unverifiable",
         "SQ-01",
         "用户把标的在链条中的位置断言为「下游」。同上：主营构成不可得，该断言无法核实，"
         "SQ-01 判为无法验证，链条位置在结论中标注为「用户断言、未经核实」。",
+        "链条位置「下游」由用户在澄清环节断言，本产品**未经核实**——"
+        "核实它需要主营构成，而该数据不在本产品的取数范围内。"
+        "结论中凡出现「标的位置」处，均按用户断言处理。",
+        "主营构成（按业务/产品/地区拆分的分部收入，用于确认标的在链条中的位置）",
     ),
     (ThesisType.TRANSMISSION, 2, "不确定"): (
         "none",
@@ -459,11 +500,31 @@ _CUSTOM_ANSWER_IMPACT = (
 )
 
 
-def _lookup_effect(
-    ttype: ThesisType, idx: int, answer: str
-) -> tuple[str, str, str]:
-    """查这张表。查不到说明选项与本表不同步——那时宁可当无效果，也不猜一个效果出来。"""
-    return ANSWER_EFFECTS.get((ttype, idx, answer), ("none", "", _CUSTOM_ANSWER_IMPACT))
+class AnswerEffect(NamedTuple):
+    """`ANSWER_EFFECTS` 一行的规范化形态。表里那几项都可以省略，
+    这里统一补成定长字段，调用方按名字取——按位置解包的话，加一项就要改一圈调用点。"""
+
+    kind: str = "none"
+    target: str = ""
+    text: str = ""
+    limitation: str = ""
+    what_is_needed: str = ""
+
+
+def _lookup_effect(ttype: ThesisType, idx: int, answer: str) -> AnswerEffect:
+    """查这张表，补齐成 `AnswerEffect`。查不到说明选项与本表不同步——
+    那时宁可当无效果，也不猜一个效果出来。"""
+    raw = ANSWER_EFFECTS.get((ttype, idx, answer))
+    if raw is None:
+        return AnswerEffect("none", "", _CUSTOM_ANSWER_IMPACT)
+    kind, target, text, *rest = raw
+    return AnswerEffect(
+        kind,
+        target,
+        text,
+        rest[0] if len(rest) > 0 else "",
+        rest[1] if len(rest) > 1 else "",
+    )
 
 
 def _clarifications(
@@ -472,8 +533,16 @@ def _clarifications(
     """构造澄清问题。
 
     用户答了就用用户的原话（`answer`），没答才落回默认假设（`assumption`）。
-    未回答路径必须与引入本功能之前逐字相同 —— 它同时是四条例题的既定行为，
-    悄悄改掉默认假设等于改掉了例题的结论。
+
+    **题面就是回答的键**，所以本函数必须用「最终确定的命题类型」调用：类型一变，
+    整组题面换掉，上一轮的回答会一条也对不上。调用点因此放在 LLM 类型判定之后
+    —— 放在它之前，会出现「题面取自规则类型、效果按 LLM 类型执行」的错位：
+    界面上写着「该子问题判为无法验证」，下游一个字节都没动。
+
+    「未回答路径逐字不变」这条约束在**默认假设文案**上被改过两处，方向是往真相那边：
+    背离型第 3 问与归因型第 2 问原本各带一句「会在结论的适用边界中声明该假设」，
+    而这两句从未兑现（默认路径上 `conclusion.limitations` 里根本没有它们）。
+    兑现不了的承诺只能删掉或改成真话；判定、证据与边界条数在默认路径上没有变。
     """
     answers = answers or {}
     out: list[ClarificationQuestion] = []
@@ -490,7 +559,7 @@ def _clarifications(
                 )
             )
             continue
-        kind, _, text = _lookup_effect(ttype, idx, given)
+        eff = _lookup_effect(ttype, idx, given)
         out.append(
             ClarificationQuestion(
                 question=q,
@@ -498,7 +567,11 @@ def _clarifications(
                 options=opts,
                 assumption=f"由用户在澄清环节指定：{given}。",
                 answer=given,
-                impact=text if kind != "none" else (text or "与本产品默认取值一致，下游不变。"),
+                impact=(
+                    eff.text if eff.kind != "none"
+                    else (eff.text or "与本产品默认取值一致，下游不变。")
+                ),
+                effect_kind=eff.kind,
             )
         )
     return out
@@ -650,6 +723,9 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
     带回答重跑时**不采用 LLM 生成的澄清问题**：回答是按上一轮界面上显示的问题填的，
     而 LLM 每次生成的问题不可复现，一旦换了一套问题，回答就会静默地对不上任何一条 ——
     「用户答了但产品没听见」比「不让答」更糟。类型判定仍可走 LLM。
+
+    因此 `_clarifications` 在 LLM 之后才调用（它要拿到最终类型），
+    并且对不上的回答一律记进 `unmatched_answers` 让前端说话，不再静默丢弃。
     """
     code, nm = _detect_subject(raw)
     ticker = resolved_ticker or code
@@ -657,8 +733,9 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
 
     ttype, rationale = _detect_type(raw)
     horizon = _detect_horizon(raw)
-    clar = _clarifications(ttype, answers)
     engine = "规则引擎"
+    used_llm = False
+    llm_clar: list[ClarificationQuestion] = []
 
     if llm_available():
         got = _llm_parse(raw, os.environ["ANTHROPIC_API_KEY"])
@@ -680,8 +757,9 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
                     else:
                         name = s
                 amb = got.get("ambiguities") or []
-                if amb and not answers:
-                    clar = [
+                if amb:
+                    # 先存着，等拿到最终类型再决定用不用它——见下面那一段。
+                    llm_clar = [
                         ClarificationQuestion(
                             question=a.get("question", ""),
                             why_it_matters=a.get("why", ""),
@@ -690,10 +768,29 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
                         )
                         for a in amb
                         if a.get("question")
-                    ] or clar
+                    ]
                 engine = "Claude 解析（规则引擎已并行校验）"
+                used_llm = True
             except (ValueError, TypeError):
                 pass
+
+    # 澄清问题在这里才构造，用的是**最终**的命题类型。
+    #
+    # 此前它在 LLM 之前用规则类型构造，而 LLM 可以把类型改成另一类：
+    # 于是「题面与 impact 文案」取自规则类型，「实际执行的动作」按 LLM 类型查表 ——
+    # 两边查不到一起时，界面上写着「该子问题判为无法验证」，下游一个字节都没动，
+    # errors 里也没有痕迹。改成一处调用点，两边就必然同源。
+    #
+    # 带回答重跑时不用 LLM 生成的问题：那些问题每次都不一样，回答是照上一轮的题面填的。
+    clar = llm_clar if (llm_clar and not answers) else _clarifications(ttype, answers)
+
+    # 「用户答了但产品没听见」必须能被看见。回答以题面为键，而题面由命题类型生成：
+    # 用户改一句命题、或 AI 把类型判成了另一类，整组题面就换掉，上一轮的回答
+    # 会一条也对不上 —— 此时按默认假设继续是对的，但必须说出来（此后端返回给前端）。
+    given_answers = [(v or "").strip() for v in (answers or {}).values()]
+    given_answers = [a for a in given_answers if a]
+    heard = {c.answer for c in clar if c.answer}
+    unmatched = sorted({a for a in given_answers if a not in heard})
 
     v1, v2, diffs = _revise(ttype, raw, name or ticker or "该标的", horizon, clar)
 
@@ -708,4 +805,6 @@ def parse_thesis(raw: str, resolved_ticker: Optional[str] = None,
         clarifications=clar,
         v2=v2,
         diffs=diffs,
+        parsed_by="llm" if used_llm else "rule_engine",
+        unmatched_answers=unmatched,
     )
