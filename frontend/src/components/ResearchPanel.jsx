@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import RichText from './RichText.jsx'
 import { verdictOf } from '../lib/ui.js'
+import { api } from '../lib/api.js'
 
 // 一次验证跑完之后，用户手上还剩三件事可做：换标的再比一遍、就某条证据追问、
 // 把反转条件存成待办。三件事都在这里，不另开页面——它们都依赖当前这次运行的上下文。
@@ -78,7 +79,7 @@ function Compare({ run }) {
     setErr(null)
     setOut(null)
     try {
-      const r = await fetch('/api/compare', {
+      const r = await fetch(api('/api/compare'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ raw_text_template: text.trim(), thscodes }),
@@ -213,7 +214,7 @@ function FollowUp({ run }) {
     setErr(null)
     setOut(null)
     try {
-      const r = await fetch('/api/followup', {
+      const r = await fetch(api('/api/followup'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -285,7 +286,7 @@ function Tasks({ run }) {
 
   const load = useCallback(async () => {
     try {
-      const r = await fetch('/api/tasks')
+      const r = await fetch(api('/api/tasks'))
       const body = await r.json()
       setSaved(body.tasks || [])
       setNote(body.note)
@@ -302,7 +303,7 @@ function Tasks({ run }) {
     setBusy(true)
     setErr(null)
     try {
-      const r = await fetch(`/api/save-task?run_id=${encodeURIComponent(run.run_id)}`, {
+      const r = await fetch(api(`/api/save-task?run_id=${encodeURIComponent(run.run_id)}`), {
         method: 'POST',
       })
       const body = await r.json()

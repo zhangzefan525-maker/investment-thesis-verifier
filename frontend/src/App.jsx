@@ -12,6 +12,7 @@ import Charts from './components/Charts.jsx'
 import ResearchPanel from './components/ResearchPanel.jsx'
 import RichText from './components/RichText.jsx'
 import { PRESETS } from './lib/ui.js'
+import { api } from './lib/api.js'
 
 const SECTIONS = [
   ['conclusion', '结论'],
@@ -33,7 +34,7 @@ export default function App() {
   const [active, setActive] = useState('conclusion')
 
   useEffect(() => {
-    fetch('/api/health')
+    fetch(api('/api/health'))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(setHealth)
       .catch((e) => setHealth({ status: 'unreachable', _error: String(e) }))
@@ -45,7 +46,7 @@ export default function App() {
     setError(null)
     setRun(null)
     try {
-      const r = await fetch('/api/verify', {
+      const r = await fetch(api('/api/verify'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ raw_text: text.trim() }),
